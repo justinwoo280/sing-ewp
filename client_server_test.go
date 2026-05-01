@@ -354,21 +354,21 @@ func TestService_AddRemoveUser(t *testing.T) {
 // ----------------------------------------------------------------------
 
 func TestParseUUID_Forms(t *testing.T) {
-	a, err := parseUUID(testUUIDStr)
+	a, err := ParseUUID(testUUIDStr)
 	if err != nil {
 		t.Fatalf("hyphenated form: %v", err)
 	}
-	b, err := parseUUID(testUUIDStrPlain)
+	b, err := ParseUUID(testUUIDStrPlain)
 	if err != nil {
 		t.Fatalf("32-hex form: %v", err)
 	}
 	if a != b {
 		t.Errorf("hyphenated vs plain disagree: %x vs %x", a, b)
 	}
-	if _, err := parseUUID("not-a-uuid"); err == nil {
+	if _, err := ParseUUID("not-a-uuid"); err == nil {
 		t.Errorf("malformed UUID should fail")
 	}
-	if _, err := parseUUID(strings.Repeat("g", 32)); err == nil {
+	if _, err := ParseUUID(strings.Repeat("g", 32)); err == nil {
 		t.Errorf("non-hex UUID should fail")
 	}
 }

@@ -74,7 +74,7 @@ func NewService(h Handler) *Service {
 
 // AddUser registers a UUID. Duplicates are ignored.
 func (s *Service) AddUser(uuidStr string) error {
-	u, err := parseUUID(uuidStr)
+	u, err := ParseUUID(uuidStr)
 	if err != nil {
 		return err
 	}
@@ -92,7 +92,7 @@ func (s *Service) AddUser(uuidStr string) error {
 
 // RemoveUser unregisters a UUID. Returns false if it was not present.
 func (s *Service) RemoveUser(uuidStr string) bool {
-	u, err := parseUUID(uuidStr)
+	u, err := ParseUUID(uuidStr)
 	if err != nil {
 		return false
 	}

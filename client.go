@@ -30,7 +30,7 @@ type Client struct {
 // NewClient parses a UUID string ("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 // or 32 hex digits) and returns a ready Client.
 func NewClient(uuidStr string) (*Client, error) {
-	u, err := parseUUID(uuidStr)
+	u, err := ParseUUID(uuidStr)
 	if err != nil {
 		return nil, err
 	}
@@ -314,9 +314,9 @@ func (f *LengthFramer) SetDeadline(t time.Time) error {
 // UUID parsing helper.
 // ----------------------------------------------------------------------
 
-// parseUUID accepts either the canonical hyphenated form
+// ParseUUID accepts either the canonical hyphenated form
 // ("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx") or 32 contiguous hex digits.
-func parseUUID(s string) ([UUIDLen]byte, error) {
+func ParseUUID(s string) ([UUIDLen]byte, error) {
 	var out [UUIDLen]byte
 	clean := strings.ReplaceAll(s, "-", "")
 	if len(clean) != 32 {
