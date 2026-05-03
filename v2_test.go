@@ -106,7 +106,12 @@ func TestHandshake_RoundTrip(t *testing.T) {
 	}
 }
 
-func TestHandshake_BadMagicRejected(t *testing.T) {
+// TestHandshake_TamperedLeadingBytesRejected replaces the legacy
+// "bad magic" test: v2 has no plaintext magic, so flipping the very
+// first byte now corrupts the nonce field. The outer MAC is computed
+// over the entire on-wire message, so any single-bit flip at any
+// position MUST cause the server to reject the ClientHello.
+func TestHandshake_TamperedLeadingBytesRejected(t *testing.T) {
 	addr := Address{Addr: netip.MustParseAddrPort("1.1.1.1:443")}
 	var captured []byte
 	if _, err := WriteClientHello(func(b []byte) error {
@@ -115,11 +120,11 @@ func TestHandshake_BadMagicRejected(t *testing.T) {
 	}, testUUID, CommandTCP, addr); err != nil {
 		t.Fatalf("WriteClientHello: %v", err)
 	}
-	captured[0] ^= 0xff // corrupt magic
+	captured[0] ^= 0xff // corrupt the very first byte of the nonce
 
 	_, _, err := AcceptClientHello(captured, MakeUUIDLookup([][UUIDLen]byte{testUUID}))
 	if err == nil {
-		t.Fatal("server accepted corrupted ClientHello")
+		t.Fatal("server accepted tampered ClientHello")
 	}
 }
 

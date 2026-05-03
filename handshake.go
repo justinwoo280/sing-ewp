@@ -14,6 +14,10 @@ import (
 // Handshake errors. All of these MUST cause the underlying transport
 // to be closed without writing any further bytes.
 var (
+	// Deprecated: v2 wire format no longer carries a plaintext magic;
+	// every byte is authenticated by the outer MAC instead. This
+	// sentinel is preserved only so external code that referenced it
+	// continues to compile.
 	ErrMagic            = errors.New("ewp/v2: bad magic")
 	ErrHandshakeShort   = errors.New("ewp/v2: handshake message too short")
 	ErrHandshakeLong    = errors.New("ewp/v2: handshake ciphertext exceeds bound")
@@ -160,6 +164,19 @@ func (s *ClientHandshakeState) ReadServerHello(msg []byte) (*HandshakeResult, er
 		return nil, fmt.Errorf("%w: 0x%02x", ErrServerStatus, sh.Status)
 	}
 
+	// Server-side timestamp sanity check.
+	//
+	// Symmetric to the server's check on ClientHello.Timestamp: a
+	// ServerHello carrying a wildly out-of-window time strongly
+	// suggests either gross clock skew (which will break later
+	// timestamp-bearing protocol features) or that we have been
+	// connected to a malicious / mis-configured peer replaying an
+	// old ServerHello. Reject early instead of moving on to ECDH.
+	now := time.Now().Unix()
+	if absDiff(int64(sh.ServerTime), now) > HandshakeTimestampWindow {
+		return nil, ErrTimestamp
+	}
+
 	// Classical shared secret.
 	curve := ecdh.X25519()
 	serverPub, err := curve.NewPublicKey(sh.ClassicalPub[:])
@@ -206,11 +223,34 @@ type UUIDLookup func(msg []byte, mac [OuterMACLen]byte) ([UUIDLen]byte, error)
 //
 // The returned ServerHello bytes MUST be delivered to the client via
 // the same transport's SendMessage path.
+//
+// This wrapper performs NO replay-detection: every well-formed
+// ClientHello whose timestamp is within HandshakeTimestampWindow will
+// be accepted, even if the server has seen the exact same bytes
+// before. Production servers SHOULD use AcceptClientHelloWithReplay
+// (which Service does internally) to harden against replay-induced
+// CPU exhaustion and traffic-correlation probes.
 func AcceptClientHello(
 	msg []byte,
 	lookup UUIDLookup,
 ) (helloOut []byte, result *HandshakeResult, err error) {
-	if len(msg) < MagicLen+OuterMACLen {
+	return AcceptClientHelloWithReplay(msg, lookup, nil)
+}
+
+// AcceptClientHelloWithReplay is the variant of AcceptClientHello that
+// additionally consults a ReplayCache. If cache is non-nil, the
+// (UUID, nonce) pair is recorded after the outer MAC + AEAD + UUID
+// checks pass; subsequent ClientHellos with the same pair will be
+// rejected with ErrReplay until ReplayWindow has elapsed.
+//
+// Passing cache == nil makes this function equivalent to
+// AcceptClientHello (replay detection disabled).
+func AcceptClientHelloWithReplay(
+	msg []byte,
+	lookup UUIDLookup,
+	cache *ReplayCache,
+) (helloOut []byte, result *HandshakeResult, err error) {
+	if len(msg) < OuterMACLen {
 		return nil, nil, ErrHandshakeShort
 	}
 
@@ -238,6 +278,16 @@ func AcceptClientHello(
 	now := time.Now().Unix()
 	if absDiff(int64(ch.Timestamp), now) > HandshakeTimestampWindow {
 		return nil, nil, ErrTimestamp
+	}
+
+	// Replay defense: only after the cryptographic checks succeed do
+	// we admit the (uuid, nonce) into the cache. Doing this before
+	// any ECDH/ML-KEM work means a replayed packet costs only one map
+	// lookup, not a full asymmetric round.
+	if cache != nil {
+		if !cache.MarkSeenOrReject(ch.UUID, ch.Nonce) {
+			return nil, nil, ErrReplay
+		}
 	}
 
 	// Server ephemeral keys.
@@ -341,14 +391,18 @@ func EncodeClientHello(ch *ClientHello) ([]byte, error) {
 		return nil, err
 	}
 
-	// Compose AAD = Magic || Nonce || ClassicalPub || PQPub || CTLen.
+	// Compose AAD = Nonce || ClassicalPub || PQPub || CTLen.
+	//
+	// v2 wire format no longer carries a plaintext "EWP2" magic;
+	// authentication of the leading bytes is provided exclusively by
+	// the outer MAC over the entire message and the AEAD that binds
+	// these same bytes as AAD.
 	ctLen := len(inner) + chacha20poly1305Overhead
 	if ctLen > 65535 {
 		return nil, ErrHandshakeLong
 	}
 
-	out := make([]byte, 0, MagicLen+HandshakeNonce+X25519PubLen+MLKEM768PubLen+2+ctLen+OuterMACLen)
-	out = append(out, Magic[:]...)
+	out := make([]byte, 0, HandshakeNonce+X25519PubLen+MLKEM768PubLen+2+ctLen+OuterMACLen)
 	out = append(out, ch.Nonce[:]...)
 	out = append(out, ch.ClassicalPub[:]...)
 	out = append(out, ch.PQPub[:]...)
@@ -368,14 +422,11 @@ func EncodeClientHello(ch *ClientHello) ([]byte, error) {
 // DecodeClientHello parses msg under the assumption that the supplied
 // uuid is the correct PSK (i.e. the outer MAC has already validated).
 func DecodeClientHello(msg []byte, uuid [UUIDLen]byte) (*ClientHello, error) {
-	const fixedHeader = MagicLen + HandshakeNonce + X25519PubLen + MLKEM768PubLen + 2
+	const fixedHeader = HandshakeNonce + X25519PubLen + MLKEM768PubLen + 2
 	if len(msg) < fixedHeader+chacha20poly1305Overhead+OuterMACLen {
 		return nil, ErrHandshakeShort
 	}
-	if string(msg[:MagicLen]) != string(Magic[:]) {
-		return nil, ErrMagic
-	}
-	off := MagicLen
+	off := 0
 
 	var nonce [HandshakeNonce]byte
 	copy(nonce[:], msg[off:off+HandshakeNonce])
@@ -443,9 +494,11 @@ func DecodeClientHello(msg []byte, uuid [UUIDLen]byte) (*ClientHello, error) {
 
 // EncodeServerHello produces the wire bytes for sh including the outer
 // MAC under uuid.
+//
+// As with ClientHello, v2 has no plaintext magic; the outer MAC over
+// the entire message provides authentication of every byte.
 func EncodeServerHello(sh *ServerHello, uuid [UUIDLen]byte) ([]byte, error) {
-	out := make([]byte, 0, MagicLen+HandshakeNonce+X25519PubLen+MLKEM768CipherL+4+1+OuterMACLen)
-	out = append(out, Magic[:]...)
+	out := make([]byte, 0, HandshakeNonce+X25519PubLen+MLKEM768CipherL+4+1+OuterMACLen)
 	out = append(out, sh.NonceEcho[:]...)
 	out = append(out, sh.ClassicalPub[:]...)
 	out = append(out, sh.PQCipher[:]...)
@@ -461,12 +514,9 @@ func EncodeServerHello(sh *ServerHello, uuid [UUIDLen]byte) ([]byte, error) {
 // DecodeServerHello parses msg under the supplied uuid and returns the
 // ServerHello if the outer MAC verifies.
 func DecodeServerHello(msg []byte, uuid [UUIDLen]byte) (*ServerHello, error) {
-	const wireLen = MagicLen + HandshakeNonce + X25519PubLen + MLKEM768CipherL + 4 + 1 + OuterMACLen
+	const wireLen = HandshakeNonce + X25519PubLen + MLKEM768CipherL + 4 + 1 + OuterMACLen
 	if len(msg) != wireLen {
 		return nil, ErrHandshakeShort
-	}
-	if string(msg[:MagicLen]) != string(Magic[:]) {
-		return nil, ErrMagic
 	}
 	macOff := wireLen - OuterMACLen
 	var tag [OuterMACLen]byte
@@ -475,7 +525,7 @@ func DecodeServerHello(msg []byte, uuid [UUIDLen]byte) (*ServerHello, error) {
 		return nil, ErrOuterMAC
 	}
 
-	off := MagicLen
+	off := 0
 	var sh ServerHello
 	copy(sh.NonceEcho[:], msg[off:off+HandshakeNonce])
 	off += HandshakeNonce

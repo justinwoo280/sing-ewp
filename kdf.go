@@ -18,7 +18,14 @@ const (
 	CounterLen     = 8
 
 	// Handshake fields
-	MagicLen        = 4
+	//
+	// MagicLen was the length of the legacy plaintext "EWP2"
+	// identifier; v2 removed it to eliminate a fixed 4-byte DPI
+	// fingerprint, so the constant is now zero. Kept as a named
+	// constant so any external code that referenced it still
+	// compiles, and so that arithmetic in Encode/Decode reads as
+	// "everything before nonce" rather than literal zeroes.
+	MagicLen        = 0
 	HandshakeNonce  = 12 // matches AEADNonceLen
 	X25519PubLen    = 32
 	MLKEM768PubLen  = 1184
@@ -41,9 +48,6 @@ const (
 	// Time window for handshake timestamp acceptance, seconds.
 	HandshakeTimestampWindow = 120
 )
-
-// Magic is the four-byte protocol identifier "EWP2".
-var Magic = [MagicLen]byte{'E', 'W', 'P', '2'}
 
 // HKDF info labels. These strings are part of the on-wire spec; do not
 // edit them without bumping the protocol.

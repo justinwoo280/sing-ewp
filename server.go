@@ -60,16 +60,41 @@ type Service struct {
 	usersMu sync.RWMutex
 	users   [][UUIDLen]byte
 	lookup  UUIDLookup // rebuilt on user changes
+
+	// replay defends against duplicate ClientHello within the
+	// handshake timestamp window. Always enabled for new Services
+	// created via NewService; tests that need to disable it can call
+	// SetReplayCache(nil).
+	replay *ReplayCache
 }
 
 // NewService creates a Service that dispatches handshaked flows to h.
+//
+// The returned Service has anti-replay enabled by default with a
+// ReplayWindow-sized cache; call SetReplayCache to override (e.g. to
+// install a custom-sized cache or disable for tests).
 func NewService(h Handler) *Service {
 	if h == nil {
 		panic("ewp: NewService: handler is nil")
 	}
-	s := &Service{handler: h}
+	s := &Service{
+		handler: h,
+		replay:  NewReplayCache(ReplayWindow),
+	}
 	s.rebuildLookup()
 	return s
+}
+
+// SetReplayCache replaces the Service's anti-replay cache. Pass nil to
+// disable replay protection entirely (NOT recommended outside tests).
+//
+// Safe to call concurrently with HandleConn — the swap is atomic from
+// the perspective of in-flight handshakes (they may use either the
+// old or the new cache, never a torn state).
+func (s *Service) SetReplayCache(cache *ReplayCache) {
+	s.usersMu.Lock()
+	s.replay = cache
+	s.usersMu.Unlock()
 }
 
 // AddUser registers a UUID. Duplicates are ignored.
@@ -154,6 +179,7 @@ func (s *Service) HandleMessageTransport(ctx context.Context, tr MessageTranspor
 func (s *Service) handleTransport(ctx context.Context, tr MessageTransport, underlying net.Conn) error {
 	s.usersMu.RLock()
 	lookup := s.lookup
+	replay := s.replay
 	s.usersMu.RUnlock()
 	if lookup == nil {
 		_ = tr.Close()
@@ -171,7 +197,7 @@ func (s *Service) handleTransport(ctx context.Context, tr MessageTransport, unde
 		_ = tr.Close()
 		return fmt.Errorf("ewp: read ClientHello: %w", err)
 	}
-	helloOut, res, err := AcceptClientHello(helloIn, lookup)
+	helloOut, res, err := AcceptClientHelloWithReplay(helloIn, lookup, replay)
 	if err != nil {
 		_ = tr.Close()
 		return fmt.Errorf("ewp: accept ClientHello: %w", err)
