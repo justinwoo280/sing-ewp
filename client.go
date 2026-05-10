@@ -2,7 +2,6 @@ package ewp
 
 import (
 	"context"
-	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -255,14 +254,23 @@ func NewLengthFramer(c net.Conn) *LengthFramer {
 
 // SendMessage writes a length prefix followed by msg. Concurrent calls
 // are serialised internally.
+//
+// The length prefix is 3 bytes big-endian (max payload 16 MiB), down
+// from v2.0's 4-byte prefix. The motivation is purely traffic-analysis:
+// v2.0's 4-byte prefix had its high two bytes ALWAYS zero (because
+// MaxFrameSize ≤ 65536), giving a free 2-byte DPI fingerprint at the
+// start of every EWP record. The 3-byte prefix uses every byte for
+// real entropy.
 func (f *LengthFramer) SendMessage(msg []byte) error {
 	if len(msg) > MaxFrameSize {
 		return ErrFrameTooLarge
 	}
 	f.writeMu.Lock()
 	defer f.writeMu.Unlock()
-	var hdr [4]byte
-	binary.BigEndian.PutUint32(hdr[:], uint32(len(msg)))
+	var hdr [3]byte
+	hdr[0] = byte(len(msg) >> 16)
+	hdr[1] = byte(len(msg) >> 8)
+	hdr[2] = byte(len(msg))
 	if _, err := f.c.Write(hdr[:]); err != nil {
 		return err
 	}
@@ -278,11 +286,11 @@ func (f *LengthFramer) SendMessage(msg []byte) error {
 func (f *LengthFramer) ReadMessage() ([]byte, error) {
 	f.readMu.Lock()
 	defer f.readMu.Unlock()
-	var hdr [4]byte
+	var hdr [3]byte
 	if _, err := io.ReadFull(f.c, hdr[:]); err != nil {
 		return nil, err
 	}
-	n := binary.BigEndian.Uint32(hdr[:])
+	n := uint32(hdr[0])<<16 | uint32(hdr[1])<<8 | uint32(hdr[2])
 	if n > MaxFrameSize {
 		return nil, ErrFrameTooLarge
 	}
