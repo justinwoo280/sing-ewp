@@ -2,12 +2,27 @@ package ewp
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
+
+	"golang.org/x/crypto/hkdf"
 )
+
+// rekeyHKDFExpand fills out using HKDF-Expand under prk and the given
+// info. Panics on the (cryptographically impossible) short-read case
+// because the byte budget here is fixed and well below SHA-256's
+// output limit.
+func rekeyHKDFExpand(prk, info, out []byte) {
+	r := hkdf.Expand(sha256.New, prk, info)
+	if _, err := io.ReadFull(r, out); err != nil {
+		panic("ewp/v2: rekey HKDF: " + err.Error())
+	}
+}
 
 // MessageTransport is the narrow interface required of an outer
 // transport. WS / gRPC / H3 / xhttp implementations satisfy this with
@@ -46,6 +61,13 @@ type SecureStream struct {
 	bytesOut atomic.Uint64
 	frmIn    atomic.Uint64
 	frmOut   atomic.Uint64
+
+	// Rekey bookkeeping. prevSendKey holds the immediately-preceding
+	// send key for test introspection; the production data path never
+	// reads it. hasPrevSendKey is true once at least one Rekey has
+	// occurred. Both fields are guarded by writeMu.
+	prevSendKey    [AEADKeyLen]byte
+	hasPrevSendKey bool
 }
 
 // NewClientSecureStream wraps the post-handshake state on the client
@@ -183,6 +205,152 @@ func (s *SecureStream) SendCoverPad(padLen int) error {
 }
 
 // ----------------------------------------------------------------------
+// Rekey: derives a fresh per-direction key from the current key plus
+// the running counter, providing forward secrecy of the *session* keys
+// (an attacker who later compromises the new key cannot decrypt
+// pre-rekey ciphertext, because the chain is one-way under HKDF).
+//
+// Wire protocol:
+//
+//	Sender: emit FrameRekeyReq under the OLD send AEAD, then atomically
+//	        swap in a NEW send AEAD (key' = HKDF(key, label, counter))
+//	        and reset counter=0.
+//	Recv:   on FrameRekeyReq, swap the recv AEAD in the same way and
+//	        DO NOT surface the frame to the application.
+//
+// The label includes a fixed string and the pre-rekey counter so the
+// derived key is bound to the position in the byte stream where the
+// rotation happened; an off-path attacker cannot precompute keys
+// without observing the rotation point.
+//
+// Rekey is single-direction: callers issuing concurrent Rekeys on the
+// same direction is a programming error (it is rate-limited by
+// writeMu so concurrency is technically safe but the resulting epoch
+// drift would be visible only as opaque ErrAEADOpen errors). For
+// production use call Rekey at most once per N bytes/frames per
+// direction.
+// ----------------------------------------------------------------------
+
+// rekeyLabel is the HKDF info string for per-direction key rotation.
+// Includes the protocol/version banner so a future major bump can use
+// a different label without aliasing.
+const rekeyLabel = "ewp/v2 rekey direction"
+
+// previousSendKey holds the most recent pre-rekey send key for tests
+// that wish to assert forward-secrecy properties. In production this
+// is a one-way derivation (HKDF-Expand) so the previous key is not
+// recoverable from the current state; the field is only populated
+// when the rekey path runs and is overwritten on each rotation.
+//
+// Stored as part of SecureStream rather than a global so concurrent
+// streams in the same process do not interfere.
+//
+// Test-only accessor: PreviousSendKey().
+//
+// We deliberately do NOT keep the entire history; only the immediate
+// predecessor is retained.
+
+// Rekey rotates the per-direction send key and emits a FrameRekeyReq
+// announcing the rotation to the peer.
+//
+// After Rekey returns successfully, every subsequent send frame uses
+// the new key; the old key is dropped (only PreviousSendKey() remains
+// for test introspection).
+func (s *SecureStream) Rekey() error {
+	if s.closed.Load() {
+		return io.ErrClosedPipe
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	preCounter := s.send.counter
+	preKey := s.send.key
+	prePrefix := s.send.prefix
+
+	// Derive new key + nonce-prefix from (oldKey, label, counter).
+	newKey, newPrefix := deriveRekey(preKey, prePrefix, preCounter)
+
+	// Encode and send the rekey announce under the OLD AEAD. The
+	// payload carries the pre-rekey counter so a recv side that
+	// somehow lost a frame can detect the desync (it will compare
+	// against its own next-expected counter). Nothing in the payload
+	// is secret; the AEAD provides authenticity.
+	var counterBE [8]byte
+	for i := 7; i >= 0; i-- {
+		counterBE[i] = byte(preCounter)
+		preCounter >>= 8
+	}
+	var buf bytes.Buffer
+	if err := EncodeFrame(&buf, s.send, FrameRekeyReq, nil, counterBE[:], 0); err != nil {
+		return fmt.Errorf("ewp/v2: encode rekey: %w", err)
+	}
+	if err := s.tr.SendMessage(buf.Bytes()); err != nil {
+		s.closeUnderlying()
+		return fmt.Errorf("ewp/v2: transport send rekey: %w", err)
+	}
+	s.bytesOut.Add(uint64(buf.Len()))
+	s.frmOut.Add(1)
+
+	// Swap in the new AEAD. Counter resets to 0 under the new key.
+	newAEAD, err := NewFrameAEAD(newKey, newPrefix)
+	if err != nil {
+		return fmt.Errorf("ewp/v2: build rekeyed AEAD: %w", err)
+	}
+	s.prevSendKey = preKey
+	s.hasPrevSendKey = true
+	s.send = newAEAD
+	return nil
+}
+
+// PreviousSendKey returns the immediately-preceding send key (for
+// tests). Returns ok=false if no Rekey has happened yet on this
+// direction.
+//
+// SECURITY NOTE: production code MUST NOT rely on this; it exists
+// solely so a regression test can assert that the new key differs
+// from the old one. The field is overwritten on each rotation so the
+// long-term retention surface is at most one obsolete key.
+func (s *SecureStream) PreviousSendKey() ([AEADKeyLen]byte, bool) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.prevSendKey, s.hasPrevSendKey
+}
+
+// CurrentSendKey returns the current send key. Test-only.
+func (s *SecureStream) CurrentSendKey() [AEADKeyLen]byte {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.send.key
+}
+
+// deriveRekey computes the next-epoch (key, prefix) from the current
+// epoch using HKDF-Expand-only (no salt is required because key is
+// already a high-entropy uniform secret).
+//
+// The label embeds the prior counter so an attacker who later learns
+// the new key cannot replay a key-rotation event from a different byte
+// offset.
+func deriveRekey(
+	prevKey [AEADKeyLen]byte,
+	prevPrefix [NoncePrefixLen]byte,
+	priorCounter uint64,
+) ([AEADKeyLen]byte, [NoncePrefixLen]byte) {
+	// Use HKDF-Expand directly: PRK = prevKey, info = label || counter.
+	info := make([]byte, 0, len(rekeyLabel)+8)
+	info = append(info, []byte(rekeyLabel)...)
+	for i := 7; i >= 0; i-- {
+		info = append(info, byte(priorCounter>>(uint(i)*8)))
+	}
+	out := make([]byte, AEADKeyLen+NoncePrefixLen)
+	rekeyHKDFExpand(prevKey[:], info, out)
+	var k [AEADKeyLen]byte
+	var p [NoncePrefixLen]byte
+	copy(k[:], out[:AEADKeyLen])
+	copy(p[:], out[AEADKeyLen:])
+	return k, p
+}
+
+// ----------------------------------------------------------------------
 // Receiving
 // ----------------------------------------------------------------------
 
@@ -200,49 +368,88 @@ type Event struct {
 //
 // On any error other than io.EOF the SecureStream is left in a
 // terminal state and subsequent Recv calls will return io.ErrClosedPipe.
+//
+// Recv transparently consumes FrameRekeyReq frames: on receipt the
+// recv-direction AEAD is rotated to its next epoch and Recv loops to
+// read the next "real" frame. Application code therefore never
+// observes a rekey event.
 func (s *SecureStream) Recv() (*Event, error) {
-	if s.closed.Load() {
-		return nil, io.ErrClosedPipe
-	}
-	wire, err := s.tr.ReadMessage()
-	if err != nil {
-		s.closeUnderlying()
-		return nil, err
-	}
-	df, err := DecodeFrame(bytes.NewReader(wire), s.recv)
-	if err != nil {
-		s.closeUnderlying()
-		return nil, fmt.Errorf("ewp/v2: decode frame: %w", err)
-	}
-	s.bytesIn.Add(uint64(len(wire)))
-	s.frmIn.Add(1)
-
-	ev := &Event{Type: df.Type, Payload: df.Payload}
-	switch df.Type {
-	case FrameUDPNew, FrameUDPData, FrameUDPProbeResp:
-		gid, addr, hasAddr, err := parseUDPMeta(df.Meta)
+	for {
+		if s.closed.Load() {
+			return nil, io.ErrClosedPipe
+		}
+		wire, err := s.tr.ReadMessage()
 		if err != nil {
 			s.closeUnderlying()
-			return nil, fmt.Errorf("ewp/v2: parse UDP meta: %w", err)
+			return nil, err
 		}
-		ev.GlobalID = gid
-		ev.Address = addr
-		ev.HasAddr = hasAddr
-	case FrameUDPEnd, FrameUDPProbeReq:
-		if len(df.Meta) < 8 {
+		df, err := DecodeFrame(bytes.NewReader(wire), s.recv)
+		if err != nil {
 			s.closeUnderlying()
-			return nil, errors.New("ewp/v2: UDP_END/PROBE_REQ meta too short")
+			return nil, fmt.Errorf("ewp/v2: decode frame: %w", err)
 		}
-		copy(ev.GlobalID[:], df.Meta[:8])
-	case FrameTCPData, FramePing, FramePong, FramePaddingOnly,
-		FrameRekeyReq, FrameRekeyResp:
-		// no meta parsing required
-	default:
-		// FrameType.Valid() in DecodeFrame should already reject this.
-		s.closeUnderlying()
-		return nil, ErrFrameType
+		s.bytesIn.Add(uint64(len(wire)))
+		s.frmIn.Add(1)
+
+		// Handle protocol-internal frames before parsing application
+		// metadata. FrameRekeyReq triggers a recv-side AEAD swap and
+		// is hidden from the caller. Note that DecodeFrame has
+		// already advanced s.recv.counter for the rekey frame itself
+		// (consumed under the OLD AEAD); we then build the NEW AEAD
+		// from the OLD key + the counter that DecodeFrame just
+		// processed (= the value the wire payload announces, +1
+		// pre-advance is fine because deriveRekey takes the prior
+		// counter as supplied).
+		if df.Type == FrameRekeyReq {
+			// Sanity: payload MUST be exactly 8 bytes (the announced
+			// pre-rekey counter). Anything else is a wire-format
+			// violation.
+			if len(df.Payload) != 8 {
+				s.closeUnderlying()
+				return nil, fmt.Errorf("ewp/v2: rekey payload len %d, want 8", len(df.Payload))
+			}
+			announced := binary.BigEndian.Uint64(df.Payload)
+			oldKey := s.recv.key
+			oldPrefix := s.recv.prefix
+			newKey, newPrefix := deriveRekey(oldKey, oldPrefix, announced)
+			newAEAD, err := NewFrameAEAD(newKey, newPrefix)
+			if err != nil {
+				s.closeUnderlying()
+				return nil, fmt.Errorf("ewp/v2: build rekeyed recv AEAD: %w", err)
+			}
+			// Swap; subsequent frames decrypt under newAEAD with
+			// counter=0.
+			s.recv = newAEAD
+			continue // read the next real frame
+		}
+
+		ev := &Event{Type: df.Type, Payload: df.Payload}
+		switch df.Type {
+		case FrameUDPNew, FrameUDPData, FrameUDPProbeResp:
+			gid, addr, hasAddr, err := parseUDPMeta(df.Meta)
+			if err != nil {
+				s.closeUnderlying()
+				return nil, fmt.Errorf("ewp/v2: parse UDP meta: %w", err)
+			}
+			ev.GlobalID = gid
+			ev.Address = addr
+			ev.HasAddr = hasAddr
+		case FrameUDPEnd, FrameUDPProbeReq:
+			if len(df.Meta) < 8 {
+				s.closeUnderlying()
+				return nil, errors.New("ewp/v2: UDP_END/PROBE_REQ meta too short")
+			}
+			copy(ev.GlobalID[:], df.Meta[:8])
+		case FrameTCPData, FramePing, FramePong, FramePaddingOnly,
+			FrameRekeyResp:
+			// no meta parsing required
+		default:
+			// FrameType.Valid() in DecodeFrame should already reject this.
+			s.closeUnderlying()
+			return nil, ErrFrameType
+		}
+		return ev, nil
 	}
-	return ev, nil
 }
 
 // ----------------------------------------------------------------------

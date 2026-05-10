@@ -78,6 +78,12 @@ type FrameAEAD struct {
 	aead    cipher.AEAD
 	prefix  [NoncePrefixLen]byte
 	counter uint64
+	// key is the raw symmetric material used to construct aead. It is
+	// retained so Rekey can derive a successor key without requiring
+	// the caller to re-supply it. Storing the key here is no worse
+	// than the cipher.AEAD itself (which retains the expanded round
+	// keys); both are wiped when the SecureStream is closed.
+	key [AEADKeyLen]byte
 }
 
 // NewFrameAEAD constructs a per-direction AEAD context.
@@ -86,7 +92,7 @@ func NewFrameAEAD(key [AEADKeyLen]byte, prefix [NoncePrefixLen]byte) (*FrameAEAD
 	if err != nil {
 		return nil, fmt.Errorf("ewp/v2: chacha20poly1305.New: %w", err)
 	}
-	return &FrameAEAD{aead: a, prefix: prefix}, nil
+	return &FrameAEAD{aead: a, prefix: prefix, key: key}, nil
 }
 
 // Counter returns the current counter (next-to-use for sender,
