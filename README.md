@@ -1,5 +1,25 @@
 # `protocol/ewp/v2` — EWP v2 protocol package
 
+> ## ⚠️ Security upgrade — v0.2.0 (EWP/v2.1)
+>
+> v0.2.0 closes a 12-finding security audit of the v0.1.x series.
+> Two findings were rated **critical** (S1: offline `ClientHello`
+> decryption when the UUID is leaked; S2: server impersonation by any
+> PSK holder) and require a wire-format break to fix.
+>
+> **For new deployments**: use `NewClientV21` / `NewServiceV21` and
+> generate a long-term server static keypair with
+> `GenerateServerStaticKeypair()`. The legacy `NewClient` / `NewService`
+> still build but speak the v0.1.x wire and remain vulnerable to S1+S2.
+>
+> **For existing deployments**: see `UPGRADING.md` for a step-by-step
+> migration playbook. v0.2.0 is **not wire-compatible with v0.1.x**;
+> coordinate the upgrade across all peers.
+>
+> The complete list of audit findings, their severity, and the
+> regression tests that lock each fix in place is in `CHANGELOG.md`
+> under "v0.2.0 — Security audit response (EWP/v2.1)".
+
 This package is the **single source of truth** for EWP v2 wire bytes,
 key derivation, framing, and the encrypted bidirectional stream that
 sits on top of an outer transport.

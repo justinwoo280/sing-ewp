@@ -1,5 +1,137 @@
 # Upgrading sing-ewp
 
+## v0.1.x → v0.2.0  (EWP/v2 → EWP/v2.1)
+
+> ⚠️ **Cryptographic break.** v0.2.0 derives every handshake key
+> differently from v0.1.x and additionally requires a long-term
+> server-side X25519 keypair. Mixed deployments **cannot interoperate**;
+> a v0.2.0 server returns `ErrOuterMAC` to every v0.1.x ClientHello,
+> and a v0.1.x server cannot decrypt a v0.2.0 ClientHello. Plan a
+> synchronized upgrade.
+
+### Why this break exists
+
+v0.1.x derived the handshake AEAD key and outer MAC key purely from
+the user UUID (= PSK). This made two practical attacks possible:
+
+- **Offline decryption (S1).** Anyone who ever held the UUID could
+  later, without observing the handshake live, decrypt every recorded
+  `ClientHello` and recover its inner contents (timestamp, command,
+  destination address, padding).
+- **Server impersonation (S2).** Any holder of the UUID could complete
+  a handshake from the server side; there was no notion of "server
+  identity" to bind against.
+
+v0.2.0 fixes both by mixing a long-term server X25519 static-ECDH
+share into the handshake KDF chain. An attacker without the server's
+static private key can neither decrypt a captured `ClientHello` nor
+impersonate the server. See `CHANGELOG.md` for the full list of 12
+findings closed.
+
+### What changed on the wire
+
+| Field                                | v0.1.2                       | v0.2.0                       |
+|--------------------------------------|------------------------------|------------------------------|
+| `ClientHello` byte layout            | nonce ‖ classical ‖ pq ‖ ctLen ‖ inner ‖ MAC | **identical** |
+| `ServerHello` byte layout            | nonce ‖ classical ‖ pqCipher ‖ time ‖ status ‖ MAC | **identical** |
+| Handshake-AEAD key derivation        | `HKDF(SHA256(UUID), nonce, "EWPv2 handshake aead")` | `HKDF(staticECDH ‖ SHA256(UUID), salt, "ewp/v2.1 outer aead")` |
+| Outer MAC                            | `HMAC(SHA256(UUID), msg)[:16]` | `HMAC(macKey, be64(innerCTLen) ‖ msg)[:16]` where `macKey` is itself derived from `staticECDH` |
+| `LengthFramer` prefix length         | 4 bytes big-endian (high 2 bytes always zero) | **3 bytes** big-endian |
+| `SessionKeys` size                   | 4 fields                     | adds `SessionID [8]byte`     |
+
+The wire bytes of `ClientHello` and `ServerHello` are arranged
+identically; only the keys used to encrypt and authenticate them
+differ. This means a v0.1.x packet on the wire is structurally
+parseable by a v0.2.0 server, but the outer MAC fails closed.
+
+### What you have to do
+
+1. **Generate a server static keypair (once per deployment).**
+
+   ```go
+   privB64, pubB64, err := ewp.GenerateServerStaticKeypair()
+   // privB64 → server config (file mode 0600)
+   // pubB64  → distributed to every authorised client
+   ```
+
+   You can also generate offline:
+
+   ```bash
+   go run -tags none . <<'EOF'
+   package main
+   import (
+       "fmt"
+       "github.com/justinwoo280/sing-ewp"
+   )
+   func main() {
+       priv, pub, _ := ewp.GenerateServerStaticKeypair()
+       fmt.Println("priv =", priv)
+       fmt.Println("pub  =", pub)
+   }
+   EOF
+   ```
+
+2. **Switch every server constructor to `NewServiceV21`.**
+
+   ```diff
+   - svc := ewp.NewService(handler)
+   + svc, err := ewp.NewServiceV21(handler, staticPrivB64)
+   + if err != nil { return err }
+   ```
+
+3. **Switch every client constructor to `NewClientV21`.**
+
+   ```diff
+   - cli, err := ewp.NewClient(uuidStr)
+   + cli, err := ewp.NewClientV21(uuidStr, serverStaticPubB64)
+   ```
+
+4. **Distribute `serverStaticPubB64` to your clients out-of-band**
+   (the same channel you already use to provision UUIDs).
+
+5. **Coordinate the cutover.** A mixed deployment surfaces only as
+   handshake failures (`ewp/v2.1: accept ClientHello: ewp/v2: outer
+   MAC verification failed`). The wire bytes do flow once, but no
+   data is exchanged.
+
+6. **No persistent state needs to be migrated.** Replay caches,
+   session keys, and per-stream counters all live for the lifetime of
+   a single connection; restarting the process discards them. There
+   is no on-disk format to upgrade.
+
+7. **Tighten your timestamp budget.** `HandshakeTimestampWindow`
+   dropped from 120 s to 30 s. Make sure NTP is running on every host
+   that participates in the handshake.
+
+### What you get
+
+- **Server identity binding.** A leaked UUID no longer compromises
+  past traffic and cannot impersonate the server going forward.
+- **Truncation-resistant outer MAC.** Any byte-length mutation of the
+  inner ciphertext is detected.
+- **Unlinkable `SessionID`.** Two handshakes from the same user yield
+  different session ids; safe for logs.
+- **Real anti-replay sharding.** `ReplayCache` admits scale across
+  cores; the previous single-mutex design did not.
+- **Fewer DPI fingerprints.** The 3-byte length prefix removes the
+  always-zero high bytes; the v2.1 KDF salt eliminates correlated
+  bits in derived keys.
+- **`Rekey()` actually rotates keys.** Long-lived sessions can ask
+  for forward secrecy of session keys; the receiver rotates
+  transparently.
+
+### What can go wrong (and how to spot it)
+
+| Symptom                                                     | Cause                                                    | Fix                                                        |
+|-------------------------------------------------------------|----------------------------------------------------------|------------------------------------------------------------|
+| `ewp/v2.1: accept ClientHello: outer MAC verification failed` on every connect | Mixed v0.1.x ↔ v0.2.0 deployment                        | Roll v0.2.0 to all peers in the same window                |
+| `ewp/v2.1: server_static_priv: invalid server static private key` | Wrong-length scalar in server config                     | Re-generate via `GenerateServerStaticKeypair`              |
+| `ewp/v2.1: x25519 keygen` errors on client                  | OS RNG unavailable                                       | Out-of-scope; investigate the host                         |
+| `ErrReplay` on the very first handshake                     | Client clock skew > 30 s                                 | Run NTP, or temporarily widen via a future config knob     |
+| Tests that asserted on `ErrTimestamp`                       | The sentinel still exists but is no longer returned      | Update assertions to `ErrReplay` (see `v2_test.go`)        |
+
+---
+
 ## v0.1.1 → v0.1.2
 
 > ⚠️ **Wire-format break.** Servers and clients running v0.1.2 cannot
