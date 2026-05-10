@@ -64,6 +64,7 @@ const (
 	infoS2CKey        = "EWPv2 s2c key"
 	infoC2SNonce      = "EWPv2 c2s nonce"
 	infoS2CNonce      = "EWPv2 s2c nonce"
+	infoSessionID     = "ewp/v2.1 sid"
 )
 
 // ErrShortKDF reports an unexpected short read from HKDF; this should
@@ -117,11 +118,26 @@ func VerifyOuterMAC(uuid [UUIDLen]byte, msg []byte, tag [OuterMACLen]byte) bool 
 
 // SessionKeys holds the derived per-direction keys produced by
 // DeriveSessionKeys.
+//
+// SessionID is an 8-byte opaque identifier derived from the same PRK
+// as the per-direction keys but with its own HKDF info label. It is
+// SAFE to log / expose / use as a connection-tracking key because it
+// (a) reveals nothing about the underlying secrets, and
+// (b) is statistically unlinkable across handshakes (the input PRK
+// includes a fresh per-handshake ephemeral ECDH share, so even two
+// handshakes from the same UUID against the same server produce
+// different ids).
+//
+// Pre-fix versions of this library exposed a session_id over the wire
+// that was a deterministic function of (UUID, server pub) and thus
+// trivially fingerprintable; v2.1 derives it from the post-handshake
+// PRK to fix H3.
 type SessionKeys struct {
-	C2SKey   [AEADKeyLen]byte
-	S2CKey   [AEADKeyLen]byte
-	C2SNonce [NoncePrefixLen]byte
-	S2CNonce [NoncePrefixLen]byte
+	C2SKey    [AEADKeyLen]byte
+	S2CKey    [AEADKeyLen]byte
+	C2SNonce  [NoncePrefixLen]byte
+	S2CNonce  [NoncePrefixLen]byte
+	SessionID [8]byte
 }
 
 // DeriveSessionKeys runs HKDF-Extract+Expand using the hybrid IKM
@@ -163,6 +179,9 @@ func DeriveSessionKeys(
 	}
 	if err := expand(prk, infoS2CNonce, sk.S2CNonce[:]); err != nil {
 		panic("ewp/v2: derive S2C nonce: " + err.Error())
+	}
+	if err := expand(prk, infoSessionID, sk.SessionID[:]); err != nil {
+		panic("ewp/v2.1: derive SessionID: " + err.Error())
 	}
 	return sk
 }
