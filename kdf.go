@@ -46,7 +46,13 @@ const (
 	UUIDLen = 16
 
 	// Time window for handshake timestamp acceptance, seconds.
-	HandshakeTimestampWindow = 120
+	//
+	// Tightened from the legacy 120s in v0.1.x. 30s comfortably
+	// covers reasonable client/server clock skew (NTP holds typical
+	// hosts well within ±5s) while making it materially harder for an
+	// on-path attacker to capture a ClientHello and re-emit it from a
+	// different vantage point.
+	HandshakeTimestampWindow = 30
 )
 
 // HKDF info labels. These strings are part of the on-wire spec; do not

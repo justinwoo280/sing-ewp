@@ -277,7 +277,15 @@ func AcceptClientHelloWithReplay(
 	}
 	now := time.Now().Unix()
 	if absDiff(int64(ch.Timestamp), now) > HandshakeTimestampWindow {
-		return nil, nil, ErrTimestamp
+		// Unify with ErrReplay so an attacker cannot distinguish
+		// "I have already seen this exact ClientHello" from
+		// "your timestamp is outside my acceptance window" via the
+		// returned error / observable response. Both are protocol
+		// failures that the client cannot recover from on the same
+		// transport, and merging them denies the attacker an oracle
+		// that would otherwise reveal whether their captured
+		// ClientHello has been replayed by someone else.
+		return nil, nil, ErrReplay
 	}
 
 	// Replay defense: only after the cryptographic checks succeed do

@@ -159,8 +159,13 @@ func TestHandshake_TimestampWindow(t *testing.T) {
 		t.Fatalf("re-encode: %v", err)
 	}
 	_, _, err = AcceptClientHello(patched, MakeUUIDLookup([][UUIDLen]byte{testUUID}))
-	if !errors.Is(err, ErrTimestamp) {
-		t.Fatalf("want ErrTimestamp, got %v", err)
+	// Post-fix: timestamp-out-of-window is unified onto ErrReplay so
+	// network observers cannot distinguish "your clock is wrong" from
+	// "I have already seen this exact ClientHello". Either failure is
+	// equally fatal to the handshake; merging removes a side-channel
+	// oracle. See audit_fixes_test.go::TestFix_M4_ReplayAndSkew_Indistinguishable.
+	if !errors.Is(err, ErrReplay) {
+		t.Fatalf("want ErrReplay (unified skew/replay error), got %v", err)
 	}
 }
 
