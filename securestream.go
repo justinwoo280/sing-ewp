@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/hkdf"
 )
 
@@ -107,17 +108,27 @@ func NewServerSecureStream(tr MessageTransport, keys SessionKeys) (*SecureStream
 // frame passes. It serialises EncodeFrame + transport SendMessage so
 // the AEAD counter and the wire ordering stay consistent.
 //
-// padLen < 0 -> a small random pad is chosen automatically to disturb
-// length signatures without inflating the wire too much.
+// padLen < 0 -> a bucket-based pad length is chosen automatically.
+// The chosen pad lifts the wire frame size onto the next entry of a
+// fixed TLS-record-shaped ladder, with a random bucket-up jump (so
+// the payload-to-wire mapping is non-monotonic) and a small jitter
+// inside each bucket (so the wire-size histogram is not a discrete
+// set of spikes). See padding_policy.go.
 func (s *SecureStream) sendFrame(t FrameType, meta, payload []byte, padLen int) error {
 	if s.closed.Load() {
 		return io.ErrClosedPipe
 	}
-	if padLen < 0 {
-		padLen = SuggestPadLen(0, 64)
-	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+
+	if padLen < 0 {
+		// rawWireLen = header + meta + cipher(meta||payload) so the
+		// ladder bucketises the actual on-wire frame size.
+		cipherLen := len(meta) + len(payload) + chacha20poly1305.Overhead
+		rawWireLen := frameHeaderSize + cipherLen
+		phaseIdx := int(s.frmOut.Load())
+		padLen = suggestStreamPad(rawWireLen, phaseIdx)
+	}
 
 	var buf bytes.Buffer
 	buf.Grow(frameHeaderSize + len(meta) + len(payload) + 16 + 2 + padLen)
