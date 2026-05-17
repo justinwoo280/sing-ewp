@@ -7,6 +7,7 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // MessageTransport is the narrow interface required of an outer
@@ -37,6 +38,19 @@ type SecureStream struct {
 	writeMu sync.Mutex
 	send    *FrameAEAD
 	recv    *FrameAEAD
+
+	// sendBuf is a reusable scratch buffer for EncodeFrameAppend.
+	// Protected by writeMu.
+	sendBuf []byte
+
+	// lastSendNs is the unix-nano timestamp of the last APPLICATION
+	// send (i.e. not a cover frame). Used by the cover-traffic loop
+	// to decide whether to emit.
+	lastSendNs atomic.Int64
+
+	// Cover-traffic goroutine state.
+	coverStarted atomic.Bool
+	coverStop    chan struct{}
 
 	closeOnce sync.Once
 	closed    atomic.Bool
@@ -82,39 +96,81 @@ func NewServerSecureStream(tr MessageTransport, keys SessionKeys) (*SecureStream
 // ----------------------------------------------------------------------
 
 // sendFrame is the single chokepoint through which every outbound
-// frame passes. It serialises EncodeFrame + transport SendMessage so
+// frame passes. It serialises encoding + transport SendMessage so
 // the AEAD counter and the wire ordering stay consistent.
 //
-// padLen < 0 -> a small random pad is chosen automatically to disturb
-// length signatures without inflating the wire too much.
+// padLen < 0 -> bucket-aware padding (see padding_policy.go).
+// padLen >= 0 -> exact pad length requested by caller (used by tests
+// and by the SendCoverPad API).
 func (s *SecureStream) sendFrame(t FrameType, meta, payload []byte, padLen int) error {
 	if s.closed.Load() {
 		return io.ErrClosedPipe
 	}
-	if padLen < 0 {
-		padLen = SuggestPadLen(0, 64)
-	}
+
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	var buf bytes.Buffer
-	buf.Grow(frameHeaderSize + len(meta) + len(payload) + 16 + 2 + padLen)
-	if err := EncodeFrame(&buf, s.send, t, meta, payload, padLen); err != nil {
+	// Determine padding policy.
+	rawWire := frameHeaderSize + len(meta) + len(payload) + aeadTagLen
+	if padLen < 0 {
+		phaseIdx := int(s.frmOut.Load())
+		padLen = suggestStreamPad(rawWire, phaseIdx)
+	}
+
+	// Reuse the per-stream send buffer; grow if needed.
+	total := rawWire + padLen
+	if cap(s.sendBuf) < total {
+		s.sendBuf = make([]byte, 0, total)
+	}
+	wireBuf, err := EncodeFrameAppend(s.sendBuf[:0], s.send, t, meta, payload, padLen)
+	if err != nil {
 		return fmt.Errorf("ewp/v2: encode %s frame: %w", frameTypeName(t), err)
 	}
-	wire := buf.Bytes()
-	if err := s.tr.SendMessage(wire); err != nil {
+	s.sendBuf = wireBuf
+
+	if err := s.tr.SendMessage(wireBuf); err != nil {
 		s.closeUnderlying()
 		return fmt.Errorf("ewp/v2: transport send: %w", err)
 	}
-	s.bytesOut.Add(uint64(len(wire)))
+	s.bytesOut.Add(uint64(len(wireBuf)))
 	s.frmOut.Add(1)
+	if t != FramePaddingOnly {
+		s.lastSendNs.Store(time.Now().UnixNano())
+	}
 	return nil
 }
 
-// SendTCPData sends a chunk of TCP payload bytes.
+// reshape thresholds. Payloads larger than reshapeThreshold are split
+// into chunks whose size is drawn uniformly from [reshapeMin, reshapeMax].
+// This destroys the "streaming download = repeated near-MaxFrameSize
+// frames" length signature.
+const (
+	reshapeThreshold = 8192
+	reshapeMin       = 4096
+	reshapeMax       = 12288
+)
+
+// SendTCPData sends a chunk of TCP payload bytes. Large payloads are
+// reshaped (split with randomised chunk sizes) before each piece is
+// wrapped in its own frame, then padded by the bucket policy.
 func (s *SecureStream) SendTCPData(payload []byte) error {
-	return s.sendFrame(FrameTCPData, nil, payload, -1)
+	if len(payload) <= reshapeThreshold {
+		return s.sendFrame(FrameTCPData, nil, payload, -1)
+	}
+	for len(payload) > 0 {
+		chunk := len(payload)
+		if chunk > reshapeMax {
+			chunk = reshapeMin + secureRandIntn(reshapeMax-reshapeMin+1)
+		}
+		if chunk > len(payload) {
+			chunk = len(payload)
+		}
+		if err := s.sendFrame(FrameTCPData, nil, payload[:chunk], -1); err != nil {
+			return err
+		}
+		payload = payload[chunk:]
+	}
+	return nil
 }
 
 // SendUDPNew opens a new UDP sub-session and optionally sends an
@@ -178,8 +234,80 @@ func (s *SecureStream) SendPong(cookie []byte) error {
 
 // SendCoverPad emits a frame that carries no application meaning, only
 // random bytes for cover. padLen is clamped to the spec maximum.
+//
+// If padLen < 0 the bucket policy chooses a reasonable size.
 func (s *SecureStream) SendCoverPad(padLen int) error {
 	return s.sendFrame(FramePaddingOnly, nil, nil, padLen)
+}
+
+// CoverConfig parameterises automatic cover traffic. A zero value
+// disables it. See StartCoverTraffic.
+type CoverConfig struct {
+	// Interval is the base tick period. A cover frame is considered
+	// for emission on every tick.
+	Interval time.Duration
+	// IdleAfter is the minimum time the stream must have been silent
+	// (no application send) before a cover frame is emitted.
+	IdleAfter time.Duration
+	// JitterFrac in [0,1] randomises Interval by +/- JitterFrac
+	// (cryptographic). 0.5 means ticks land in [0.5*I, 1.5*I].
+	JitterFrac float64
+}
+
+// DefaultCoverConfig is a starting point: emit a cover frame after
+// ~500ms of application silence, with 50% jitter on the cadence.
+var DefaultCoverConfig = CoverConfig{
+	Interval:   500 * time.Millisecond,
+	IdleAfter:  500 * time.Millisecond,
+	JitterFrac: 0.5,
+}
+
+// StartCoverTraffic starts a background goroutine that periodically
+// emits a FramePaddingOnly frame if no application data has been sent
+// recently. The goroutine exits on SecureStream.Close.
+//
+// Calling StartCoverTraffic more than once is a no-op for subsequent
+// calls.
+func (s *SecureStream) StartCoverTraffic(cfg CoverConfig) {
+	if cfg.Interval <= 0 || cfg.IdleAfter <= 0 {
+		return
+	}
+	if !s.coverStarted.CompareAndSwap(false, true) {
+		return
+	}
+	s.coverStop = make(chan struct{})
+	go s.coverLoop(cfg)
+}
+
+func (s *SecureStream) coverLoop(cfg CoverConfig) {
+	nextDelay := func() time.Duration {
+		if cfg.JitterFrac <= 0 {
+			return cfg.Interval
+		}
+		spanNs := int(float64(cfg.Interval) * cfg.JitterFrac * 2)
+		if spanNs < 1 {
+			return cfg.Interval
+		}
+		offset := time.Duration(secureRandIntn(spanNs)) - time.Duration(spanNs/2)
+		return cfg.Interval + offset
+	}
+	t := time.NewTimer(nextDelay())
+	defer t.Stop()
+	for {
+		select {
+		case <-s.coverStop:
+			return
+		case <-t.C:
+		}
+		if s.closed.Load() {
+			return
+		}
+		last := time.Unix(0, s.lastSendNs.Load())
+		if time.Since(last) >= cfg.IdleAfter {
+			_ = s.SendCoverPad(-1)
+		}
+		t.Reset(nextDelay())
+	}
 }
 
 // ----------------------------------------------------------------------
@@ -255,6 +383,9 @@ func (s *SecureStream) Close() error {
 	var err error
 	s.closeOnce.Do(func() {
 		s.closed.Store(true)
+		if s.coverStop != nil {
+			close(s.coverStop)
+		}
 		err = s.tr.Close()
 	})
 	return err

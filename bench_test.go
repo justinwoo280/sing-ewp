@@ -103,3 +103,58 @@ func newPairBench(b *testing.B) (*FrameAEAD, *FrameAEAD) {
 	}
 	return a, c
 }
+
+// nullTransport is a MessageTransport that discards every Send.
+type nullTransport struct{}
+
+func (nullTransport) SendMessage(b []byte) error  { return nil }
+func (nullTransport) ReadMessage() ([]byte, error) { return nil, io.EOF }
+func (nullTransport) Close() error                 { return nil }
+
+// BenchmarkSecureStream_SendTCPData_1KiB measures the hot path on the
+// SecureStream itself, including bucket-aware padding lookup and
+// reuse of the per-stream send buffer.
+func BenchmarkSecureStream_SendTCPData_1KiB(b *testing.B) {
+	var keys SessionKeys
+	for i := range keys.C2SKey {
+		keys.C2SKey[i] = byte(i)
+	}
+	for i := range keys.S2CKey {
+		keys.S2CKey[i] = byte(i ^ 0xff)
+	}
+	ss, err := NewClientSecureStream(nullTransport{}, keys)
+	if err != nil {
+		b.Fatal(err)
+	}
+	payload := make([]byte, 1024)
+	b.SetBytes(int64(len(payload)))
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := ss.SendTCPData(payload); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkSecureStream_SendTCPData_16KiB exercises the reshape path
+// (16KiB > reshapeThreshold so the payload is split).
+func BenchmarkSecureStream_SendTCPData_16KiB(b *testing.B) {
+	var keys SessionKeys
+	for i := range keys.C2SKey {
+		keys.C2SKey[i] = byte(i)
+	}
+	ss, err := NewClientSecureStream(nullTransport{}, keys)
+	if err != nil {
+		b.Fatal(err)
+	}
+	payload := make([]byte, 16*1024)
+	b.SetBytes(int64(len(payload)))
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := ss.SendTCPData(payload); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

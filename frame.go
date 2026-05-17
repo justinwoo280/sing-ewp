@@ -56,6 +56,10 @@ const (
 	frameHdrMetaLen  = 2 // big-endian uint16
 	frameHdrPadLen   = 2 // big-endian uint16
 	frameHeaderSize  = frameHdrFrameLen + frameHdrCounter + frameHdrType + frameHdrMetaLen + frameHdrPadLen
+
+	// aeadTagLen is exposed so callers (SecureStream, padding policy,
+	// transports) can size buffers without importing chacha20poly1305.
+	aeadTagLen = chacha20poly1305.Overhead
 )
 
 // Errors surfaced by frame encode/decode.
@@ -114,67 +118,102 @@ func (f *FrameAEAD) composeNonce(counter uint64) [AEADNonceLen]byte {
 //
 // EncodeFrame increments the AEAD counter on success.
 func EncodeFrame(w io.Writer, f *FrameAEAD, t FrameType, meta, payload []byte, padLen int) error {
+	wire, err := EncodeFrameAppend(nil, f, t, meta, payload, padLen)
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(wire)
+	return err
+}
+
+// EncodeFrameAppend appends one encoded frame to dst and returns the
+// extended slice. If dst has enough capacity the whole frame is built
+// without any allocation:
+//
+//   - The 17-byte plaintext header is written in place.
+//   - The AEAD seal runs in-place (dst=plaintext[:0]) so the ciphertext
+//     reuses the plaintext storage; no separate ciphertext buffer.
+//   - The padding bytes are drawn from crypto/rand directly into the
+//     dst buffer.
+//
+// Callers that want zero-alloc steady-state I/O should pre-grow dst to
+// (frameHeaderSize + len(meta) + len(payload) + chacha20poly1305.Overhead
+// + padLen) before calling.
+//
+// On success the AEAD counter advances by 1.
+func EncodeFrameAppend(dst []byte, f *FrameAEAD, t FrameType, meta, payload []byte, padLen int) ([]byte, error) {
 	if !t.Valid() {
-		return ErrFrameType
+		return dst, ErrFrameType
 	}
 	if len(meta) > MaxMetaLen {
-		return ErrMetaTooLarge
+		return dst, ErrMetaTooLarge
 	}
 	if padLen < 0 {
 		padLen = 0
 	}
 	if padLen > MaxFramePad {
-		return ErrPadTooLarge
+		return dst, ErrPadTooLarge
 	}
 
-	cipherLen := len(meta) + len(payload) + chacha20poly1305.Overhead
+	plainLen := len(meta) + len(payload)
+	cipherLen := plainLen + chacha20poly1305.Overhead
 
-	// FrameLen counts everything after the FrameLen field itself.
-	// = Counter + FrameType + MetaLen + PadLen + cipher + pad.
 	frameLen := frameHdrCounter + frameHdrType + frameHdrMetaLen + frameHdrPadLen +
 		cipherLen + padLen
 	if frameLen > MaxFrameSize {
-		return ErrFrameTooLarge
+		return dst, ErrFrameTooLarge
 	}
+
+	totalWire := frameHeaderSize + cipherLen + padLen
+	base := len(dst)
+
+	// Grow dst in one shot if needed. If the caller pre-sized dst,
+	// this is a no-op append.
+	if cap(dst)-base < totalWire {
+		grown := make([]byte, base+totalWire)
+		copy(grown, dst)
+		dst = grown
+	} else {
+		dst = dst[:base+totalWire]
+	}
+	wire := dst[base:]
 
 	counter := f.counter
+
+	// Header (also serves as AAD).
+	binary.BigEndian.PutUint32(wire[0:4], uint32(frameLen))
+	binary.BigEndian.PutUint64(wire[4:12], counter)
+	wire[12] = byte(t)
+	binary.BigEndian.PutUint16(wire[13:15], uint16(len(meta)))
+	binary.BigEndian.PutUint16(wire[15:17], uint16(padLen))
+	hdr := wire[:frameHeaderSize]
+
+	// Lay plaintext (meta || payload) into the wire region where the
+	// ciphertext will end up.
+	plainStart := frameHeaderSize
+	if plainLen > 0 {
+		copy(wire[plainStart:], meta)
+		copy(wire[plainStart+len(meta):], payload)
+	}
+
+	// In-place AEAD seal. The crypto/cipher.AEAD contract allows
+	// dst=plaintext[:0] (reuse plaintext storage). After Seal,
+	// wire[plainStart : plainStart+cipherLen] holds cipher||tag.
 	nonce := f.composeNonce(counter)
+	plainSlice := wire[plainStart : plainStart+plainLen]
+	_ = f.aead.Seal(plainSlice[:0], nonce[:], plainSlice, hdr)
 
-	// Build header in one allocation; the entire header is AAD.
-	hdr := make([]byte, frameHeaderSize)
-	binary.BigEndian.PutUint32(hdr[0:4], uint32(frameLen))
-	binary.BigEndian.PutUint64(hdr[4:12], counter)
-	hdr[12] = byte(t)
-	binary.BigEndian.PutUint16(hdr[13:15], uint16(len(meta)))
-	binary.BigEndian.PutUint16(hdr[15:17], uint16(padLen))
-
-	// Plaintext = meta || payload, sealed with AAD = header.
-	plain := make([]byte, 0, len(meta)+len(payload))
-	plain = append(plain, meta...)
-	plain = append(plain, payload...)
-	cipherBuf := f.aead.Seal(nil, nonce[:], plain, hdr)
-
-	pad := make([]byte, padLen)
+	// Random pad bytes go directly into the wire buffer; no temporary.
 	if padLen > 0 {
-		if _, err := io.ReadFull(crand.Reader, pad); err != nil {
-			return fmt.Errorf("ewp/v2: pad rand: %w", err)
-		}
-	}
-
-	if _, err := w.Write(hdr); err != nil {
-		return err
-	}
-	if _, err := w.Write(cipherBuf); err != nil {
-		return err
-	}
-	if padLen > 0 {
-		if _, err := w.Write(pad); err != nil {
-			return err
+		if _, err := io.ReadFull(crand.Reader, wire[plainStart+cipherLen:]); err != nil {
+			// Roll back dst since we promised "on error counter does not
+			// advance and frame is not emitted".
+			return dst[:base], fmt.Errorf("ewp/v2: pad rand: %w", err)
 		}
 	}
 
 	f.counter = counter + 1
-	return nil
+	return dst, nil
 }
 
 // DecodedFrame is the result of DecodeFrame. The Meta and Payload
