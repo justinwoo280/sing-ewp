@@ -229,6 +229,11 @@ func (s *Service) handleTransport(ctx context.Context, tr MessageTransport, unde
 	switch res.ClientHello.Command {
 	case CommandTCP:
 		appConn := &streamConn{SecureStream: stream, underlying: underlying}
+		// Shape the server->client (download) timeline too: cover
+		// traffic during idle response gaps plus write coalescing
+		// breaks the burst silhouette on the return path. Still fully
+		// padded + AEAD-sealed via SecureStream (Rule 2 holds).
+		appConn.shaper = NewStreamShaper(stream, DefaultShaperConfig())
 		return s.handler.NewConnection(ctx, appConn, meta)
 	case CommandUDP:
 		// For UDP we need to wait for the first UDP_NEW frame so we can

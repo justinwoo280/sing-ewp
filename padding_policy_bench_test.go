@@ -12,7 +12,7 @@ func BenchmarkPaddingPolicy_PadToBucket_Steady(b *testing.B) {
 func BenchmarkPaddingPolicy_PadToBucket_Handshake(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		_ = padToBucket(800, handshakeBuckets)
+		_ = padToBucket(800, steadyBuckets)
 	}
 }
 

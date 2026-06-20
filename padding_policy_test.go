@@ -10,7 +10,7 @@ import (
 // after padding, wire size always lands at or above the smallest
 // fitting bucket and never exceeds the next bucket + jitter window.
 func TestPaddingPolicy_BucketMonotonicity(t *testing.T) {
-	for _, ladder := range [][]int{steadyBuckets, handshakeBuckets} {
+	for _, ladder := range [][]int{steadyBuckets} {
 		top := ladder[len(ladder)-1]
 		for raw := 1; raw <= top; raw += 37 {
 			pad := padToBucket(raw, ladder)
@@ -103,33 +103,44 @@ func TestPaddingPolicy_OversizeClamped(t *testing.T) {
 	}
 }
 
-// TestPaddingPolicy_PhaseSwitch verifies the handshake-phase ladder
-// is used for the first handshakePhaseFrames frames and steady after.
+// TestPaddingPolicy_PhaseSwitch verifies the opening-phase silhouette
+// floor is applied for the first handshakePhaseFrames frames and that
+// the steady regime (which allows small buckets) takes over after.
 func TestPaddingPolicy_PhaseSwitch(t *testing.T) {
-	// A tiny raw (64) lands at the smallest bucket of whichever ladder
-	// is active; handshake ladder's smallest is 1500, steady's is 256.
+	// A tiny raw (64) should be lifted toward the per-position
+	// handshake floor (capped by MaxFramePad) during the opening phase.
 	const raw = 64
-	// During handshake phase, wire size should always be >= 1500.
 	for i := 0; i < handshakePhaseFrames; i++ {
 		pad := suggestStreamPad(raw, i)
 		wire := raw + pad
-		if wire < handshakeBuckets[0] {
-			t.Fatalf("handshake-phase frame %d: wire=%d < %d", i, wire, handshakeBuckets[0])
+		floor := handshakeFloor(i)
+		want := floor
+		if want-raw > MaxFramePad {
+			want = raw + MaxFramePad // floor unreachable in one frame
+		}
+		// Wire must reach at least the (reachable) floor, minus the
+		// jitter slack that bucketisation may shave when clamping.
+		if wire < want-jitterWithinBucket {
+			t.Fatalf("handshake-phase frame %d: wire=%d < floor target %d (raw floor=%d)",
+				i, wire, want, floor)
+		}
+		if pad > MaxFramePad {
+			t.Fatalf("handshake-phase frame %d: pad=%d exceeds MaxFramePad", i, pad)
 		}
 	}
 	// Steady phase: a tiny raw should be allowed to land in the small
-	// 256-byte bucket at least sometimes (proves we switched ladders).
+	// 256-byte bucket at least sometimes (proves we left the floor).
 	hitSmall := false
 	for i := handshakePhaseFrames; i < handshakePhaseFrames+200; i++ {
 		pad := suggestStreamPad(raw, i)
 		wire := raw + pad
-		if wire < handshakeBuckets[0] {
+		if wire < 512 {
 			hitSmall = true
 			break
 		}
 	}
 	if !hitSmall {
-		t.Fatalf("steady phase never produced small-bucket frame; ladder did not switch")
+		t.Fatalf("steady phase never produced small-bucket frame; floor never lifted")
 	}
 }
 
@@ -278,7 +289,23 @@ func TestPaddingPolicy_EndToEndWireOnBucket(t *testing.T) {
 	for i, wireMsg := range cap.frames {
 		wire := len(wireMsg)
 		if i < handshakePhaseFrames {
-			check(wire, handshakeBuckets, i)
+			// Opening phase: wire must reach the per-position floor
+			// (clamped by MaxFramePad), but is no longer required to
+			// land exactly on a ladder bucket since the floor lift +
+			// clamp can leave it between buckets.
+			rawWire := frameHeaderSize + payloads[i] + chacha20poly1305Overhead
+			floor := handshakeFloor(i)
+			want := floor
+			if want-rawWire > MaxFramePad {
+				want = rawWire + MaxFramePad
+			}
+			if wire < rawWire {
+				t.Fatalf("frame %d (payload=%d) wire=%d < raw %d", i, payloads[i], wire, rawWire)
+			}
+			if rawWire < floor && wire < want-jitterWithinBucket {
+				t.Fatalf("frame %d (payload=%d) wire=%d below floor target %d",
+					i, payloads[i], wire, want)
+			}
 		} else {
 			check(wire, steadyBuckets, i)
 		}

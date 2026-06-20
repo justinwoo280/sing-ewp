@@ -394,13 +394,20 @@ func TestLengthFramer_RejectsOversizeRead(t *testing.T) {
 	defer b.Close()
 
 	// Manually inject a length header claiming MaxFrameSize+1.
+	//
+	// LengthFramer uses a 3-byte big-endian length prefix (see
+	// LengthFramer.ReadMessage / WriteMessage), so the injected header
+	// must also be 3 bytes. The earlier 4-byte form left a stray byte
+	// in the pipe and made the framer read a bogus (in-range) length,
+	// then block forever in io.ReadFull on a pipe that is never
+	// closed — hanging the test instead of exercising the oversize
+	// rejection path.
 	go func() {
-		var hdr [4]byte
+		var hdr [3]byte
 		n := uint32(MaxFrameSize + 1)
-		hdr[0] = byte(n >> 24)
-		hdr[1] = byte(n >> 16)
-		hdr[2] = byte(n >> 8)
-		hdr[3] = byte(n)
+		hdr[0] = byte(n >> 16)
+		hdr[1] = byte(n >> 8)
+		hdr[2] = byte(n)
 		_, _ = a.Write(hdr[:])
 	}()
 	f := NewLengthFramer(b)

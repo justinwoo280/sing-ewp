@@ -46,12 +46,34 @@ var (
 		16384,
 	}
 
-	handshakeBuckets = []int{
-		1500,
-		4096,
-		8192,
-		12288,
-		16384,
+	// handshakeFloorProfile gives a per-position minimum target size
+	// (in wire bytes) for the opening frames of a SecureStream. It is
+	// shaped like a real TLS-1.3 handshake record silhouette as seen
+	// on the wire:
+	//
+	//   pos 0      small ClientHello-ish record   (~512)
+	//   pos 1      ServerHello / EncryptedExt      (~1500)
+	//   pos 2..4   Certificate flight (the big one) (~8-12 KiB)
+	//   pos 5..6   CertVerify / Finished pair      (~1500)
+	//   pos 7+     settling toward steady traffic   (~1024)
+	//
+	// Padding only ever raises a frame to its floor (never shrinks a
+	// genuinely larger frame), and the per-position floor is then run
+	// through the steady ladder + jitter so the result is still a
+	// bucketised, non-monotonic wire size. The point is that the
+	// OPENING SEQUENCE of frame sizes resembles a TLS handshake
+	// instead of the old "16 uniformly medium frames" shape that no
+	// real endpoint emits.
+	handshakeFloorProfile = []int{
+		512,   // 0: ClientHello
+		1500,  // 1: ServerHello + EncryptedExtensions
+		8192,  // 2: Certificate (start of cert flight)
+		12288, // 3: Certificate (continued)
+		8192,  // 4: Certificate (tail)
+		1500,  // 5: CertificateVerify
+		1500,  // 6: Finished
+		1024,  // 7
+		1024,  // 8
 	}
 )
 
@@ -165,11 +187,59 @@ func padToBucket(rawWireLen int, ladder []int) int {
 //
 //	frameHeaderSize + len(meta) + len(payload) + chacha20poly1305.Overhead
 func suggestStreamPad(rawWireLen, phaseFrameIndex int) int {
-	ladder := steadyBuckets
 	if phaseFrameIndex < handshakePhaseFrames {
-		ladder = handshakeBuckets
+		return suggestHandshakePad(rawWireLen, phaseFrameIndex)
 	}
-	return padToBucket(rawWireLen, ladder)
+	return padToBucket(rawWireLen, steadyBuckets)
+}
+
+// suggestHandshakePad shapes an opening-phase frame toward a per-
+// position floor drawn from a TLS-1.3 record silhouette, then runs the
+// result through the steady ladder + jitter. The total pad is clamped
+// to MaxFramePad: a single EWP frame can lift a small payload by at
+// most MaxFramePad bytes, so a floor above (rawWireLen + MaxFramePad)
+// is approached as closely as one frame allows. The big Certificate-
+// flight positions therefore reach their full silhouette only when the
+// inner record is itself large (the common case for a real cert
+// flight); a tiny inner record is lifted as far as one frame permits
+// and the rest of the silhouette is carried by the following frames.
+func suggestHandshakePad(rawWireLen, phaseFrameIndex int) int {
+	floor := handshakeFloor(phaseFrameIndex)
+
+	raw := rawWireLen
+	if floor > raw {
+		raw = floor
+		// Cap the floor lift so the frame stays paddable in one shot.
+		if raw-rawWireLen > MaxFramePad {
+			raw = rawWireLen + MaxFramePad
+		}
+	}
+
+	// Bucketise the (possibly lifted) size on the steady ladder, then
+	// express the answer as pad relative to the ORIGINAL rawWireLen and
+	// clamp to MaxFramePad so EncodeFrame never rejects it.
+	pad := padToBucket(raw, steadyBuckets) + (raw - rawWireLen)
+	if pad > MaxFramePad {
+		pad = MaxFramePad
+	}
+	if pad < 0 {
+		pad = 0
+	}
+	return pad
+}
+
+// handshakeFloor returns the per-position minimum wire size for the
+// opening frames. Positions past the end of the explicit profile use
+// the last entry (a modest 1 KiB floor) so the tail of the handshake
+// window settles smoothly into steady traffic.
+func handshakeFloor(pos int) int {
+	if pos < 0 {
+		return 0
+	}
+	if pos >= len(handshakeFloorProfile) {
+		return handshakeFloorProfile[len(handshakeFloorProfile)-1]
+	}
+	return handshakeFloorProfile[pos]
 }
 
 // secureRandIntn returns a value in [0, n).

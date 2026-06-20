@@ -55,10 +55,12 @@ func (c *Client) DialConn(ctx context.Context, conn net.Conn, dst Address) (net.
 	if err != nil {
 		return nil, err
 	}
-	return &streamConn{
+	sc := &streamConn{
 		SecureStream: stream,
 		underlying:   conn,
-	}, nil
+	}
+	sc.shaper = NewStreamShaper(stream, DefaultShaperConfig())
+	return sc, nil
 }
 
 // DialPacketConn performs the EWP v2 handshake over conn requesting a
@@ -125,6 +127,15 @@ type streamConn struct {
 	*SecureStream
 	underlying net.Conn
 
+	// shaper, when non-nil, reshapes the send timeline (coalescing +
+	// idle cover traffic) so the on-wire burst/timing pattern no
+	// longer mirrors the inner protocol. Writes go through it; it
+	// still funnels every frame through SecureStream so all bytes stay
+	// padded + AEAD-sealed. Nil means writes go straight to
+	// SecureStream.SendTCPData (legacy behaviour, used by the server
+	// side and by callers that opt out).
+	shaper *StreamShaper
+
 	readMu  sync.Mutex
 	readBuf []byte // unread portion of last decoded TCP DATA payload
 
@@ -166,6 +177,14 @@ func (c *streamConn) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
+	if c.shaper != nil {
+		// The shaper copies p and owns chunking/coalescing; it always
+		// accepts the whole buffer.
+		if err := c.shaper.WriteTCP(p); err != nil {
+			return 0, err
+		}
+		return len(p), nil
+	}
 	// Chunk to MaxFrameSize-margin so that AEAD overhead + meta does
 	// not push a single frame past the wire limit.
 	const maxPayload = MaxFrameSize - 256
@@ -186,7 +205,16 @@ func (c *streamConn) Write(p []byte) (int, error) {
 
 func (c *streamConn) Close() error {
 	c.closeOnce.Do(func() {
-		c.closeErr = c.SecureStream.Close()
+		if c.shaper != nil {
+			// Flush residual buffered bytes and stop the cover loop
+			// before tearing down the stream.
+			if err := c.shaper.Close(); err != nil && c.closeErr == nil {
+				c.closeErr = err
+			}
+		}
+		if err := c.SecureStream.Close(); err != nil && c.closeErr == nil {
+			c.closeErr = err
+		}
 		if c.underlying != nil {
 			if err := c.underlying.Close(); err != nil && c.closeErr == nil {
 				c.closeErr = err
@@ -240,10 +268,10 @@ func (c *streamConn) SetWriteDeadline(t time.Time) error {
 // LengthFramer wraps a net.Conn so it satisfies MessageTransport via a
 // simple uint32 big-endian length prefix per message.
 type LengthFramer struct {
-	c        net.Conn
-	writeMu  sync.Mutex
-	readMu   sync.Mutex
-	readBuf  []byte // reusable scratch
+	c       net.Conn
+	writeMu sync.Mutex
+	readMu  sync.Mutex
+	readBuf []byte // reusable scratch
 }
 
 // NewLengthFramer builds a LengthFramer around c. The framer takes
