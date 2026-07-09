@@ -295,15 +295,46 @@ func (f *LengthFramer) SendMessage(msg []byte) error {
 	}
 	f.writeMu.Lock()
 	defer f.writeMu.Unlock()
-	var hdr [3]byte
-	hdr[0] = byte(len(msg) >> 16)
-	hdr[1] = byte(len(msg) >> 8)
-	hdr[2] = byte(len(msg))
-	if _, err := f.c.Write(hdr[:]); err != nil {
+
+	// Header + body in ONE contiguous write. On message-framed
+	// transports (gRPC, where every Write becomes one stream Hunk) a
+	// split header/body would otherwise emit two independent records.
+	frame := make([]byte, 3+len(msg))
+	frame[0] = byte(len(msg) >> 16)
+	frame[1] = byte(len(msg) >> 8)
+	frame[2] = byte(len(msg))
+	copy(frame[3:], msg)
+	if _, err := f.c.Write(frame); err != nil {
 		return err
 	}
-	if _, err := f.c.Write(msg); err != nil {
-		return err
+	return f.flush()
+}
+
+// flusher is implemented by transports that BUFFER writes and only push
+// them onto the wire on an explicit flush. Plain TCP/TLS conns do NOT
+// implement it (a Write is already on the wire), so flush() is a no-op
+// there. Batching transports — gRPC streams, XHTTP stream-up (chunked
+// HTTP/2 request body), h2/h3 response writers — DO buffer, and without
+// a flush the EWP handshake (a strict synchronous ClientHello/
+// ServerHello round-trip) DEADLOCKS: the ClientHello never leaves the
+// local send buffer, both peers block on read, and the stream
+// eventually tears down, surfacing on the client as
+// "read ServerHello: EOF".
+type flusher interface{ Flush() error }
+
+// httpFlusher matches net/http's http.Flusher (Flush() with no return),
+// as exposed by h2/h3 response writers and by transport conns that wrap
+// them.
+type httpFlusher interface{ Flush() }
+
+// flush pushes any transport-buffered bytes onto the wire. It is a
+// no-op on transports that do not buffer (plain TCP/TLS).
+func (f *LengthFramer) flush() error {
+	switch v := f.c.(type) {
+	case flusher:
+		return v.Flush()
+	case httpFlusher:
+		v.Flush()
 	}
 	return nil
 }
