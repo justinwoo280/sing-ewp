@@ -43,6 +43,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	"crypto/mlkem"
@@ -168,13 +169,38 @@ func WriteClientHelloV21(
 		return nil, fmt.Errorf("%w: %v", ErrStaticPub, err)
 	}
 
-	x25519Priv, err := curve.GenerateKey(crand.Reader)
-	if err != nil {
-		return nil, fmt.Errorf("ewp/v2.1: x25519 keygen: %w", err)
+	// Parallelize X25519 and ML-KEM-768 key generation — the two
+	// keypairs are cryptographically independent, so generating them
+	// concurrently halves the keygen latency without changing any
+	// derived value or wire byte.
+	var (
+		x25519Priv *ecdh.PrivateKey
+		mlkemPriv  *mlkem.DecapsulationKey768
+		x25519Err  error
+		mlkemErr   error
+		keyWg      sync.WaitGroup
+	)
+	keyWg.Add(2)
+	go func() {
+		defer keyWg.Done()
+		x25519Priv, x25519Err = curve.GenerateKey(crand.Reader)
+		if x25519Err != nil {
+			x25519Err = fmt.Errorf("ewp/v2.1: x25519 keygen: %w", x25519Err)
+		}
+	}()
+	go func() {
+		defer keyWg.Done()
+		mlkemPriv, mlkemErr = mlkem.GenerateKey768()
+		if mlkemErr != nil {
+			mlkemErr = fmt.Errorf("ewp/v2.1: mlkem keygen: %w", mlkemErr)
+		}
+	}()
+	keyWg.Wait()
+	if x25519Err != nil {
+		return nil, x25519Err
 	}
-	mlkemPriv, err := mlkem.GenerateKey768()
-	if err != nil {
-		return nil, fmt.Errorf("ewp/v2.1: mlkem keygen: %w", err)
+	if mlkemErr != nil {
+		return nil, mlkemErr
 	}
 
 	hello := &ClientHello{
@@ -515,31 +541,59 @@ func acceptClientHelloV21(
 		}
 	}
 
-	// Continue with ECDH/ML-KEM derivation as in v2.0 — this part is
-	// orthogonal to the S1+S2+H2 fix.
-	srvX25519Priv, err := curve.GenerateKey(crand.Reader)
-	if err != nil {
+	// Parallelize the server's X25519 keygen+ECDH and the ML-KEM-768
+	// encapsulation — they are cryptographically independent, so both
+	// halves of the hybrid share are computed concurrently. Inputs and
+	// outputs are identical to the sequential version.
+	var (
+		srvX25519Priv *ecdh.PrivateKey
+		classical     []byte
+		pqShared      []byte
+		pqCipher      []byte
+		xErr          error
+		mlkemErr      error
+		cryptoWg      sync.WaitGroup
+	)
+	cryptoWg.Add(2)
+	go func() {
+		defer cryptoWg.Done()
+		srvX25519Priv, xErr = curve.GenerateKey(crand.Reader)
+		if xErr != nil {
+			xErr = fmt.Errorf("ewp/v2.1: server x25519 keygen: %w", xErr)
+			return
+		}
+		classical, xErr = srvX25519Priv.ECDH(cliEph)
+		if xErr != nil {
+			xErr = fmt.Errorf("ewp/v2.1: server x25519 ecdh: %w", xErr)
+		}
+	}()
+	go func() {
+		defer cryptoWg.Done()
+		cliMLKEMPub, e := mlkem.NewEncapsulationKey768(ch.PQPub[:])
+		if e != nil {
+			mlkemErr = fmt.Errorf("ewp/v2.1: parse client mlkem pub: %w", e)
+			return
+		}
+		pqShared, pqCipher = cliMLKEMPub.Encapsulate()
+		if len(pqCipher) != MLKEM768CipherL {
+			mlkemErr = fmt.Errorf("ewp/v2.1: unexpected ML-KEM cipher size %d", len(pqCipher))
+		}
+	}()
+	cryptoWg.Wait()
+	// On failure, wipe every secret either branch may have produced
+	// before returning: because the two halves run concurrently, one
+	// can succeed while the other fails.
+	if xErr != nil || mlkemErr != nil {
+		zero(classical)
+		zero(pqShared)
 		zero(staticShare)
-		return nil, nil, fmt.Errorf("ewp/v2.1: server x25519 keygen: %w", err)
-	}
-	classical, err := srvX25519Priv.ECDH(cliEph)
-	if err != nil {
-		zero(staticShare)
-		return nil, nil, fmt.Errorf("ewp/v2.1: server x25519 ecdh: %w", err)
+		if xErr != nil {
+			return nil, nil, xErr
+		}
+		return nil, nil, mlkemErr
 	}
 	var classicalArr [X25519PubLen]byte
 	copy(classicalArr[:], classical)
-
-	cliMLKEMPub, err := mlkem.NewEncapsulationKey768(ch.PQPub[:])
-	if err != nil {
-		zero(staticShare)
-		return nil, nil, fmt.Errorf("ewp/v2.1: parse client mlkem pub: %w", err)
-	}
-	pqShared, pqCipher := cliMLKEMPub.Encapsulate()
-	if len(pqCipher) != MLKEM768CipherL {
-		zero(staticShare)
-		return nil, nil, fmt.Errorf("ewp/v2.1: unexpected ML-KEM cipher size %d", len(pqCipher))
-	}
 
 	sh := &ServerHello{
 		NonceEcho:  ch.Nonce,
@@ -688,17 +742,46 @@ func (s *ClientHandshakeState) ReadServerHelloV21(
 	if err != nil {
 		return nil, fmt.Errorf("ewp/v2.1: parse server ephemeral x25519 pub: %w", err)
 	}
-	classical, err := s.x25519Priv.ECDH(srvEphPub)
-	if err != nil {
-		return nil, fmt.Errorf("ewp/v2.1: ephemeral x25519 ecdh: %w", err)
+	// Parallelize the ephemeral X25519 ECDH and the ML-KEM-768
+	// decapsulation — they are cryptographically independent, so both
+	// halves of the hybrid share are recovered concurrently.
+	var (
+		classical []byte
+		pq        []byte
+		ecdhErr   error
+		decapErr  error
+		cryptoWg  sync.WaitGroup
+	)
+	cryptoWg.Add(2)
+	go func() {
+		defer cryptoWg.Done()
+		classical, ecdhErr = s.x25519Priv.ECDH(srvEphPub)
+		if ecdhErr != nil {
+			ecdhErr = fmt.Errorf("ewp/v2.1: ephemeral x25519 ecdh: %w", ecdhErr)
+		}
+	}()
+	go func() {
+		defer cryptoWg.Done()
+		pq, decapErr = s.mlkemPriv.Decapsulate(sh.PQCipher[:])
+		if decapErr != nil {
+			decapErr = fmt.Errorf("ewp/v2.1: mlkem decapsulate: %w", decapErr)
+		}
+	}()
+	cryptoWg.Wait()
+	// On failure, wipe every secret either branch may have produced
+	// before returning: because the two halves run concurrently, one
+	// can succeed while the other fails.
+	if ecdhErr != nil || decapErr != nil {
+		zero(classical)
+		zero(pq)
+		if ecdhErr != nil {
+			return nil, ecdhErr
+		}
+		return nil, decapErr
 	}
+
 	var classicalArr [X25519PubLen]byte
 	copy(classicalArr[:], classical)
-
-	pq, err := s.mlkemPriv.Decapsulate(sh.PQCipher[:])
-	if err != nil {
-		return nil, fmt.Errorf("ewp/v2.1: mlkem decapsulate: %w", err)
-	}
 
 	keys := DeriveSessionKeys(classicalArr, pq, s.hello.Nonce, sh.NonceEcho)
 
