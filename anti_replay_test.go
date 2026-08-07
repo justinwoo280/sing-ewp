@@ -8,6 +8,7 @@ import (
 
 func TestReplayCache_FirstSeenAdmits(t *testing.T) {
 	c := NewReplayCache(time.Second)
+	t.Cleanup(c.Close)
 	var u [UUIDLen]byte
 	var n [HandshakeNonce]byte
 	u[0] = 0xab
@@ -19,6 +20,7 @@ func TestReplayCache_FirstSeenAdmits(t *testing.T) {
 
 func TestReplayCache_SecondSeenRejects(t *testing.T) {
 	c := NewReplayCache(time.Second)
+	t.Cleanup(c.Close)
 	var u [UUIDLen]byte
 	var n [HandshakeNonce]byte
 	if !c.MarkSeenOrReject(u, n) {
@@ -31,6 +33,7 @@ func TestReplayCache_SecondSeenRejects(t *testing.T) {
 
 func TestReplayCache_DistinctNoncesIndependent(t *testing.T) {
 	c := NewReplayCache(time.Second)
+	t.Cleanup(c.Close)
 	var u [UUIDLen]byte
 	var n1, n2 [HandshakeNonce]byte
 	n2[0] = 0x01
@@ -44,6 +47,7 @@ func TestReplayCache_DistinctNoncesIndependent(t *testing.T) {
 
 func TestReplayCache_DistinctUUIDsIndependent(t *testing.T) {
 	c := NewReplayCache(time.Second)
+	t.Cleanup(c.Close)
 	var u1, u2 [UUIDLen]byte
 	u2[0] = 0xff
 	var n [HandshakeNonce]byte
@@ -60,6 +64,7 @@ func TestReplayCache_ExpiryReadmits(t *testing.T) {
 	// time.Now().Unix(), so we must wait > 1 full second of wall
 	// clock to be sure we cross the boundary.
 	c := NewReplayCache(time.Second)
+	t.Cleanup(c.Close)
 	var u [UUIDLen]byte
 	var n [HandshakeNonce]byte
 	if !c.MarkSeenOrReject(u, n) {
@@ -75,6 +80,7 @@ func TestReplayCache_ConcurrentAdmitsRaceFree(t *testing.T) {
 	// Run a high-contention burst through MarkSeenOrReject and
 	// confirm exactly one goroutine sees the "admit" outcome.
 	c := NewReplayCache(time.Minute)
+	t.Cleanup(c.Close)
 	var u [UUIDLen]byte
 	var n [HandshakeNonce]byte
 
@@ -108,6 +114,7 @@ func TestReplayCache_GCEvictsExpired(t *testing.T) {
 	// Force enough admits to trigger the opportunistic sweep, then
 	// verify Len shrinks back to roughly the live-set size.
 	c := NewReplayCache(20 * time.Millisecond)
+	t.Cleanup(c.Close)
 	var u [UUIDLen]byte
 	var n [HandshakeNonce]byte
 	for i := 0; i < gcInterval+10; i++ {
@@ -131,4 +138,10 @@ func TestReplayCache_GCEvictsExpired(t *testing.T) {
 	if got := c.Len(); got > 2*gcInterval {
 		t.Fatalf("GC failed to bound cache size: %d entries remain", got)
 	}
+}
+
+func TestReplayCache_CloseIsIdempotent(t *testing.T) {
+	c := NewReplayCache(time.Minute)
+	c.Close()
+	c.Close()
 }

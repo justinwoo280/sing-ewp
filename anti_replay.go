@@ -81,7 +81,8 @@ type ReplayCache struct {
 	shards [replayShardCount]replayShard
 	window time.Duration
 
-	stopCh chan struct{}
+	stopCh   chan struct{}
+	doneCh   chan struct{}
 	stopOnce sync.Once
 }
 
@@ -95,6 +96,7 @@ func NewReplayCache(window time.Duration) *ReplayCache {
 	c := &ReplayCache{
 		window: window,
 		stopCh: make(chan struct{}),
+		doneCh: make(chan struct{}),
 	}
 	for i := range c.shards {
 		c.shards[i].entries = make(map[replayKey]int64)
@@ -107,9 +109,11 @@ func NewReplayCache(window time.Duration) *ReplayCache {
 // times.
 func (c *ReplayCache) Close() {
 	c.stopOnce.Do(func() { close(c.stopCh) })
+	<-c.doneCh
 }
 
 func (c *ReplayCache) gcLoop() {
+	defer close(c.doneCh)
 	period := gcTickInterval
 	if w := c.window / 3; w < period {
 		period = w

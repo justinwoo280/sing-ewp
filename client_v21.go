@@ -140,7 +140,7 @@ func (c *ClientV21) handshake(
 // responsibility to protect it (file mode 0600, KMS, etc.); rotating
 // it requires re-issuing every client's serverStaticPub configuration.
 type ServiceV21 struct {
-	handler   Handler
+	handler    Handler
 	staticPriv *ecdh.PrivateKey
 
 	usersMu sync.RWMutex
@@ -148,6 +148,7 @@ type ServiceV21 struct {
 	lookup  UUIDLookupV21
 
 	replay *ReplayCache
+	closed bool
 }
 
 // NewServiceV21 builds a Service that authenticates clients under the
@@ -194,8 +195,37 @@ func GenerateServerStaticKeypair() (privB64, pubB64 string, err error) {
 // SetReplayCache mirrors Service.SetReplayCache.
 func (s *ServiceV21) SetReplayCache(cache *ReplayCache) {
 	s.usersMu.Lock()
+	if s.closed {
+		s.usersMu.Unlock()
+		if cache != nil {
+			cache.Close()
+		}
+		return
+	}
+	oldCache := s.replay
 	s.replay = cache
 	s.usersMu.Unlock()
+	if oldCache != nil && oldCache != cache {
+		oldCache.Close()
+	}
+}
+
+// Close releases resources owned by the service. It is safe to call more
+// than once. A cache installed with SetReplayCache is owned by the service.
+func (s *ServiceV21) Close() error {
+	s.usersMu.Lock()
+	if s.closed {
+		s.usersMu.Unlock()
+		return nil
+	}
+	s.closed = true
+	cache := s.replay
+	s.replay = nil
+	s.usersMu.Unlock()
+	if cache != nil {
+		cache.Close()
+	}
+	return nil
 }
 
 // AddUser / RemoveUser / Users mirror their Service counterparts.

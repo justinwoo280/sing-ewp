@@ -66,6 +66,7 @@ type Service struct {
 	// created via NewService; tests that need to disable it can call
 	// SetReplayCache(nil).
 	replay *ReplayCache
+	closed bool
 }
 
 // NewService creates a Service that dispatches handshaked flows to h.
@@ -93,8 +94,37 @@ func NewService(h Handler) *Service {
 // old or the new cache, never a torn state).
 func (s *Service) SetReplayCache(cache *ReplayCache) {
 	s.usersMu.Lock()
+	if s.closed {
+		s.usersMu.Unlock()
+		if cache != nil {
+			cache.Close()
+		}
+		return
+	}
+	oldCache := s.replay
 	s.replay = cache
 	s.usersMu.Unlock()
+	if oldCache != nil && oldCache != cache {
+		oldCache.Close()
+	}
+}
+
+// Close releases resources owned by the service. It is safe to call more
+// than once. A cache installed with SetReplayCache is owned by the service.
+func (s *Service) Close() error {
+	s.usersMu.Lock()
+	if s.closed {
+		s.usersMu.Unlock()
+		return nil
+	}
+	s.closed = true
+	cache := s.replay
+	s.replay = nil
+	s.usersMu.Unlock()
+	if cache != nil {
+		cache.Close()
+	}
+	return nil
 }
 
 // AddUser registers a UUID. Duplicates are ignored.

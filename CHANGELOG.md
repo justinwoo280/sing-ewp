@@ -5,6 +5,13 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## v0.2.6 — Service lifecycle cleanup
+
+- Added `Close` methods to the EWP services so their anti-replay cache
+  sweeper goroutines terminate when the service is closed.
+- `ReplayCache.Close` now waits for the sweeper to exit and cache replacement
+  closes the previous cache.
+
 ## v0.2.0 — Security audit response (EWP/v2.1)
 
 This release closes a 12-finding security audit of the v0.1.x series.
