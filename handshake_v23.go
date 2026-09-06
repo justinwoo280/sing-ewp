@@ -553,6 +553,7 @@ type v23Server struct {
 	keys      *v23OuterKeyStore
 	routes    map[[V23RouteTagLen]byte][UUIDLen]byte
 	admission *v23Admission
+	replay    *ReplayCache
 	now       func() time.Time
 }
 
@@ -569,6 +570,7 @@ func newV23Server(cfg *V23ServerConfig) (*v23Server, error) {
 		keys:      keys,
 		routes:    make(map[[V23RouteTagLen]byte][UUIDLen]byte, len(cfg.UUIDs)),
 		admission: newV23Admission(0, 0, 0, 0),
+		replay:    NewReplayCache(ReplayWindow),
 		now:       time.Now,
 	}
 	for _, u := range cfg.UUIDs {
@@ -635,6 +637,24 @@ func (s *v23Server) HandleClientHello(ctx interface{ Done() <-chan struct{} }, i
 	key := s.keys.lookup(hr.OuterKeyID)
 	if key == nil {
 		return nil, nil, ErrV23Cookie
+	}
+
+	// Cross-handshake replay rejection. The cookie proves the ClientInit is
+	// fresh (bound to source + a server nonce + a 10 s expiry), but it does
+	// not stop an on-path observer from re-submitting the *same* ClientInit
+	// and ClientHello inside the timestamp window: each replay would pass
+	// the cookie and timestamp checks and, because the server picks a fresh
+	// ServerNonce every time, would derive an independent session — the
+	// server could not tell the replay apart from a legitimate reconnect.
+	// Remembering (UUID, ClientNonce) for the replay window lets the server
+	// *reject* the duplicate outright instead of silently accepting it,
+	// before any expensive KEM work. The ClientNonce is the client-generated
+	// random nonce already authenticated by the cookie and the outer AEAD, so
+	// a replay necessarily repeats it.
+	var nonce [HandshakeNonce]byte
+	copy(nonce[:], ci.ClientNonce[:HandshakeNonce])
+	if s.replay != nil && !s.replay.MarkSeenOrReject(uuid, nonce) {
+		return nil, nil, ErrReplay
 	}
 
 	kemRelease, err := s.admission.acquireKEM(ctx)

@@ -128,27 +128,42 @@ carrier without any asymmetric operation.
 
 ## Replay (H-04)
 
-Replay protection moves from "timestamp + process-local nonce cache" to:
+Replay protection is layered:
 
 - the cookie binds `client_nonce` to the source and a 10 s expiry, so a
   replayed ClientInit from a different source fails immediately;
+- a process-local `(UUID, ClientNonce)` replay cache (`ReplayCache`, shared
+  with the rest of the v2 line) rejects an identical handshake transcript
+  re-submitted inside the timestamp window — before any KEM work. Without
+  this, an on-path observer replaying the same ClientInit+ClientHello would
+  pass the cookie and timestamp checks and, because the server draws a fresh
+  ServerNonce each time, would derive an *independent* session the server
+  could not distinguish from a legitimate reconnect. The cache turns that
+  silent acceptance into an explicit `ErrReplay`;
 - the Finished exchange proves possession of the derived keys, so a replayed
   ClientHello cannot produce a live session or trigger a handler.
 
-The process-local cache remains as a second line, but a restart no longer
-enables handler side effects because the handler gate moved behind Finished.
+The cache is process-local and bounded (fail-closed at `maxReplayEntries`);
+losing it on restart does not enable handler side effects because the handler
+gate moved behind Finished. This is deliberately weaker than v3's one-time
+prekey burn + persistent `ReplayKey` store (true single-use semantics across
+restarts and instances), which v2.3 omits to stay stateless and
+bundle-free.
 
 ## Record layer
 
 Unchanged from v2.2: `frame_v22.go` opaque records, bucketized outer length,
-phase-aware padding. v2.3 session keys are tagged `protocolVersionV23` and
-rejected by v2.2 stream constructors.
+phase-aware padding. v2.3 session keys share the v2.2 opaque record layer
+(`protocolVersionV22`).
 
 ## What v2.3 deliberately does NOT do
 
 - No one-time prekey bundles or bundle distribution (that is v3's design and
   its operational cost). The short-term outer key gives forward secrecy over
   the rotation window, not per-connection.
-- No persistent or cross-instance replay store; Finished-gating makes the
-  process-local cache safe to lose.
+- No persistent or cross-instance replay store. The process-local
+  `(UUID, ClientNonce)` cache rejects in-window duplicates for the running
+  process; unlike v3's prekey burn, a restart within the timestamp window
+  forgets seen nonces, though Finished-gating still blocks any handler side
+  effect.
 - No change to the v2.2 record format, UDP-over-TCP model, or padding policy.

@@ -3,6 +3,7 @@ package ewp
 import (
 	"bytes"
 	"context"
+	"errors"
 	"encoding/base64"
 	"io"
 	"net"
@@ -177,6 +178,54 @@ func TestV23HandlerGatedOnFinished(t *testing.T) {
 	select {
 	case <-serverDone:
 	case <-time.After(2 * time.Second):
+	}
+}
+
+// TestV23HandshakeReplayRejected proves that re-submitting an identical
+// (ClientInit, HelloRetry, ClientHello) transcript inside the timestamp
+// window is rejected with ErrReplay, not silently accepted as a fresh
+// session. The first admission succeeds; the second, carrying the same
+// (UUID, ClientNonce), must fail before any KEM work.
+func TestV23HandshakeReplayRejected(t *testing.T) {
+	fx := newV23Fixture(t)
+	if err := fx.service.AddUser(v23TestUUID); err != nil {
+		t.Fatal(err)
+	}
+	defer fx.service.Close()
+
+	fx.service.mu.RLock()
+	server := fx.service.server
+	fx.service.mu.RUnlock()
+	if server == nil {
+		t.Fatal("service has no v23 server")
+	}
+
+	// Build one full (init, retry, hello) transcript against the live server.
+	var initWire []byte
+	state, err := WriteV23ClientInit(func(msg []byte) error {
+		initWire = append([]byte(nil), msg...)
+		return nil
+	}, fx.client.uuid, fx.serverID, 0, fx.client.serverPub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hrWire, err := server.HandleClientInit(initWire, "test-source")
+	if err != nil {
+		t.Fatalf("HandleClientInit: %v", err)
+	}
+	chWire, err := state.ReadV23HelloRetry(hrWire, CommandTCP, Address{Domain: "replay.example", Port: 443})
+	if err != nil {
+		t.Fatalf("ReadV23HelloRetry: %v", err)
+	}
+
+	ctx := context.Background()
+	// First admission: must succeed.
+	if _, _, err := server.HandleClientHello(ctx, initWire, hrWire, chWire, "test-source"); err != nil {
+		t.Fatalf("first HandleClientHello failed: %v", err)
+	}
+	// Replay of the identical transcript: must be rejected as a replay.
+	if _, _, err := server.HandleClientHello(ctx, initWire, hrWire, chWire, "test-source"); !errors.Is(err, ErrReplay) {
+		t.Fatalf("replayed handshake: got err=%v, want ErrReplay", err)
 	}
 }
 

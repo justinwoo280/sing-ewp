@@ -222,7 +222,11 @@ func (s *ServiceV23) rebuildLocked() error {
 	if err != nil {
 		return err
 	}
+	old := s.server
 	s.server = srv
+	if old != nil && old.replay != nil {
+		old.replay.Close()
+	}
 	return nil
 }
 
@@ -344,8 +348,12 @@ func (s *ServiceV23) handleTransport(ctx context.Context, tr MessageTransport, u
 func (s *ServiceV23) Close() error {
 	s.mu.Lock()
 	s.closed = true
+	server := s.server
 	s.server = nil
 	s.mu.Unlock()
+	if server != nil && server.replay != nil {
+		server.replay.Close()
+	}
 	return nil
 }
 
