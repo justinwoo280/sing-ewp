@@ -166,15 +166,10 @@ func (p *packetConn) ReadFrom(b []byte) (int, net.Addr, error) {
 func (p *packetConn) Close() error {
 	p.closeOnce.Do(func() {
 		p.openedMu.Lock()
-		defer p.openedMu.Unlock()
-		// Best-effort UDP_END: ignore errors (peer may have closed)
-		// and bound the attempt with a short deadline so a dead peer
-		// can't hang Close indefinitely.
-		if p.opened && p.underlying != nil {
-			_ = p.underlying.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
-			_ = p.stream.SendUDPEnd(p.globalID)
-			_ = p.underlying.SetWriteDeadline(time.Time{})
+		if p.opened {
+			p.sendEndBestEffort()
 		}
+		p.openedMu.Unlock()
 		p.closeErr = p.stream.Close()
 		if p.underlying != nil {
 			if err := p.underlying.Close(); err != nil && p.closeErr == nil {
@@ -186,6 +181,33 @@ func (p *packetConn) Close() error {
 		}
 	})
 	return p.closeErr
+}
+
+// sendEndBestEffort emits UDP_END with a hard 100 ms bound. The previous
+// implementation set a write deadline on p.underlying, but SendUDPEnd
+// writes through the SecureStream's MessageTransport — a deadline on the
+// raw conn does not reliably interrupt a transport whose SendMessage is
+// blocked on peer back-pressure (and the write mutex it holds would then
+// block stream.Close, hanging Close forever and leaking the session
+// goroutine). Timing out and closing the stream is the only operation
+// guaranteed to interrupt a blocked send: abortTransport closes the
+// carrier underneath it. Mirrors v3's v3UDPPacketSession.sendEndBestEffort.
+func (p *packetConn) sendEndBestEffort() {
+	done := make(chan struct{})
+	go func() {
+		_ = p.stream.SendUDPEnd(p.globalID)
+		close(done)
+	}()
+	timer := time.NewTimer(100 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+		// A blocked send is a carrier-level failure; closing the stream
+		// interrupts it so session teardown cannot deadlock.
+		_ = p.stream.Close()
+		<-done
+	}
 }
 
 func (p *packetConn) LocalAddr() net.Addr {
