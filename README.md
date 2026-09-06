@@ -1,32 +1,50 @@
 # `protocol/ewp/v2` — EWP v2 protocol package
 
-> ## ⚠️ Security upgrade — v0.2.0 (EWP/v2.1)
+> ## Security status
 >
-> v0.2.0 closes a 12-finding security audit of the v0.1.x series.
-> Two findings were rated **critical** (S1: offline `ClientHello`
-> decryption when the UUID is leaked; S2: server impersonation by any
-> PSK holder) and require a wire-format break to fix.
+> EWP/v2.2 adds padded opaque data-plane records to the pinned-server-identity
+> handshake. New deployments must use `NewClientV22` / `NewServiceV22`; v2.1
+> remains only for coordinated migration and still exposes exact data-plane
+> frame structure. The legacy `NewClient` / `NewService` APIs are deprecated
+> and do not authenticate the server.
 >
-> **For new deployments**: use `NewClientV21` / `NewServiceV21` and
-> generate a long-term server static keypair with
-> `GenerateServerStaticKeypair()`. The legacy `NewClient` / `NewService`
-> still build but speak the v0.1.x wire and remain vulnerable to S1+S2.
+> The current implementation is **not approved for strict-security
+> deployment**. v2.2 mitigates data-plane exact-length exposure, but it does
+> not provide ClientHello metadata forward secrecy after a static-key
+> compromise, distributed replay protection, a Finished exchange, or
+> pre-authentication DoS resistance. See
+> `SECURITY_AUDIT_BASELINE_AND_REMEDIATION_PLAN.md` before deployment.
 >
-> **For existing deployments**: see `UPGRADING.md` for a step-by-step
-> migration playbook. v0.2.0 is **not wire-compatible with v0.1.x**;
-> coordinate the upgrade across all peers.
->
-> The complete list of audit findings, their severity, and the
-> regression tests that lock each fix in place is in `CHANGELOG.md`
-> under "v0.2.0 — Security audit response (EWP/v2.1)".
+> v2.2 protects post-handshake data frames against a later compromise of the
+> server static key, subject to the stated cryptographic assumptions. It does
+> not provide post-compromise recovery; `Rekey` is one-way key evolution.
 
 This package is the **single source of truth** for EWP v2 wire bytes,
 key derivation, framing, and the encrypted bidirectional stream that
 sits on top of an outer transport.
 
-The wire format itself is documented in [`doc/EWP_V2.md`](../../../doc/EWP_V2.md).
+The v2.2 record format is documented in [`EWP_V22.md`](EWP_V22.md).
 This file is the **API surface contract** for callers in the same
 binary (TUN handler, server dispatcher, transports, ewpmobile).
+
+## Protocol Layers
+
+`ClientHello` and `ServerHello` in this package mean **EWP protocol messages**.
+They are distinct from `TLS ClientHello` and `TLS ServerHello`. When TLS is
+used, TLS is the optional outer transport and EWP starts after that transport
+is established:
+
+```text
+TLS ClientHello / TLS ServerHello
+    -> EWP ClientInit / EWP HelloRetry
+    -> EWP ClientHello / EWP ServerHello
+    -> EWP ClientFinished / EWP ServerFinished
+    -> EWP encrypted records
+```
+
+The audit findings about ClientHello metadata, replay, cookies, and Finished
+messages refer to the EWP layer. TLS adds transport protection but does not
+replace those EWP protocol controls.
 
 ---
 
@@ -82,11 +100,11 @@ A "message" is one atomic blob delivered as-is. Transports do not look
 at the bytes, do not pad them, do not split them, do not coalesce
 them. All padding / framing / encryption is this package's job.
 
-### Rule 4 — No version negotiation
+### Rule 4 — No silent version fallback
 
-There is no v1, no v3, no opt-in, no downgrade. `Magic` is `"EWP2"`,
-hard-coded. A peer that disagrees with these bytes is wrong, not
-"different". Drop the connection.
+Wire revisions have distinct derivations and no automatic fallback. A peer
+that does not use the configured revision must fail closed; do not probe a
+legacy revision after a v2.2 handshake failure.
 
 ---
 
@@ -95,17 +113,17 @@ hard-coded. A peer that disagrees with these bytes is wrong, not
 ### Handshake
 
 ```go
-// CLIENT side
-state, err := v2.WriteClientHello(send, uuid, v2.CommandTCP|CommandUDP, addr)
+// CLIENT side: serverStaticPub must be pinned from trusted configuration.
+state, err := v2.WriteClientHelloV22(send, uuid, v2.CommandTCP|CommandUDP, addr, serverStaticPub)
 //   send is the transport's SendMessage. Returns ClientHandshakeState
 //   that holds the ephemeral keys until ServerHello arrives.
 
-result, err := state.ReadServerHello(serverHelloMsg)
-//   result.Keys is the SessionKeys to feed NewClientSecureStream.
+result, err := state.ReadServerHelloV22(serverHelloMsg, serverStaticPub)
+//   result.Keys is the SessionKeys to feed NewClientSecureStreamV22.
 
 // SERVER side
-helloOut, result, err := v2.AcceptClientHello(clientHelloMsg, lookup)
-//   lookup := v2.MakeUUIDLookup([]uuid)
+helloOut, result, err := v2.AcceptClientHelloV22WithReplay(clientHelloMsg, lookup, serverStaticPriv, replayCache)
+//   lookup := v2.MakeUUIDLookupV21([]uuid)
 //   server then SendMessage(helloOut) and uses result.Keys.
 ```
 
@@ -113,8 +131,8 @@ helloOut, result, err := v2.AcceptClientHello(clientHelloMsg, lookup)
 
 ```go
 // One per outer transport connection.
-ss, err := v2.NewClientSecureStream(transport, sessionKeys)
-ss, err := v2.NewServerSecureStream(transport, sessionKeys)
+ss, err := v2.NewClientSecureStreamV22(transport, sessionKeys)
+ss, err := v2.NewServerSecureStreamV22(transport, sessionKeys)
 
 // TCP-style bytes
 err := ss.SendTCPData(payload)
@@ -136,7 +154,7 @@ err := ss.SendPong(cookie)
 // Cover traffic
 err := ss.SendCoverPad(padBytes)
 
-// Receive (single goroutine; the dispatcher loop)
+// Receive (a single dispatcher is recommended for event ordering)
 ev, err := ss.Recv()
 //   ev.Type, ev.GlobalID, ev.Address, ev.HasAddr, ev.Payload
 
@@ -157,7 +175,7 @@ addr, n, err := v2.DecodeAddress(buf)
 
 ### Frame primitives (you almost never need these directly)
 
-`FrameAEAD`, `EncodeFrame`, `DecodeFrame`, `SuggestPadLen`,
+`FrameAEAD`, `EncodeFrameV22`, `DecodeFrameV22`, `SuggestPadLen`,
 `NewGlobalID`. SecureStream wraps these. Direct use is reserved for
 tests and the rare protocol diagnostic.
 
@@ -198,8 +216,10 @@ the PQ overhead is invisible to users.
 ```
 address.go      Address codec (IPv4 / IPv6 / domain).
 aead.go         Tiny chacha20poly1305 wrapper to keep imports tidy.
-frame.go        Wire-level frame encode/decode + per-direction AEAD.
+frame.go        Legacy clear-header frame codec + per-direction AEAD.
+frame_v22.go    Opaque v2.2 record codec.
 handshake.go    ClientHello / ServerHello + X25519 + ML-KEM-768.
+handshake_v22.go v2.2 handshake wrappers and version boundary.
 kdf.go          HKDF-based key & MAC derivation; constants & magic.
 securestream.go High-level Send*/Recv API used by everything else.
 v2_test.go      11 tests covering correctness + replay + tampering +
@@ -214,8 +234,8 @@ bench_test.go   Microbenchmarks (handshake & frame throughput).
 * `SecureStream.Send*` methods are safe for concurrent calls. They
   serialise internally via `writeMu` so the AEAD counter and the wire
   ordering stay consistent.
-* `SecureStream.Recv` MUST be called from a single goroutine. It
-  advances the receive AEAD counter; concurrent calls would race.
+* `SecureStream.Recv` serializes concurrent calls internally. A single
+  reader remains the recommended model for predictable event ordering.
 * `SecureStream.Close` is idempotent and safe from any goroutine.
 * `FrameAEAD` itself is not goroutine-safe. SecureStream is the only
   entry point that touches it; do not share a `FrameAEAD` across

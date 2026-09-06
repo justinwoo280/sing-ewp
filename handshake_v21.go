@@ -99,23 +99,33 @@ func deriveV21OuterKeys(
 	nonce [HandshakeNonce]byte,
 	clientEphPub [X25519PubLen]byte,
 ) (aeadKey, macKey [AEADKeyLen]byte) {
+	return deriveOuterKeys(&v21Suite, staticECDH, uuid, nonce, clientEphPub)
+}
+
+func deriveOuterKeys(
+	suite *protocolSuite,
+	staticECDH []byte,
+	uuid [UUIDLen]byte,
+	nonce [HandshakeNonce]byte,
+	clientEphPub [X25519PubLen]byte,
+) (aeadKey, macKey [AEADKeyLen]byte) {
 	psk := uuidPSK(uuid)
 	ikm := make([]byte, 0, len(staticECDH)+len(psk))
 	ikm = append(ikm, staticECDH...)
 	ikm = append(ikm, psk[:]...)
 
-	saltAEAD := append([]byte(v21LabelOuterAEADSalt), nonce[:]...)
+	saltAEAD := append([]byte(suite.outerAEADSalt), nonce[:]...)
 	saltAEAD = append(saltAEAD, clientEphPub[:]...)
-	rA := hkdf.New(sha256.New, ikm, saltAEAD, []byte(v21LabelOuterAEAD))
+	rA := hkdf.New(sha256.New, ikm, saltAEAD, []byte(suite.outerAEAD))
 	if _, err := io.ReadFull(rA, aeadKey[:]); err != nil {
-		panic("ewp/v2.1: HKDF aead: " + err.Error())
+		panic(suite.name + ": HKDF aead: " + err.Error())
 	}
 
-	saltMAC := append([]byte(v21LabelOuterMACSalt), nonce[:]...)
+	saltMAC := append([]byte(suite.outerMACSalt), nonce[:]...)
 	saltMAC = append(saltMAC, clientEphPub[:]...)
-	rM := hkdf.New(sha256.New, ikm, saltMAC, []byte(v21LabelOuterMAC))
+	rM := hkdf.New(sha256.New, ikm, saltMAC, []byte(suite.outerMAC))
 	if _, err := io.ReadFull(rM, macKey[:]); err != nil {
-		panic("ewp/v2.1: HKDF mac: " + err.Error())
+		panic(suite.name + ": HKDF mac: " + err.Error())
 	}
 	return
 }
@@ -129,6 +139,10 @@ func deriveV21OuterKeys(
 // where msg is the wire bytes from the very first byte of the message
 // up to (but not including) the MAC.
 func v21OuterMAC(macKey [AEADKeyLen]byte, innerCTLen int, msg []byte) [OuterMACLen]byte {
+	return outerMAC(macKey, innerCTLen, msg)
+}
+
+func outerMAC(macKey [AEADKeyLen]byte, innerCTLen int, msg []byte) [OuterMACLen]byte {
 	h := hmac.New(sha256.New, macKey[:])
 	var lenBuf [8]byte
 	binary.BigEndian.PutUint64(lenBuf[:], uint64(innerCTLen))
@@ -150,12 +164,25 @@ func v21OuterMAC(macKey [AEADKeyLen]byte, innerCTLen int, msg []byte) [OuterMACL
 // (32 bytes). The client embeds NO copy of it on the wire; the key is
 // only fed into the KDF, so an on-path observer learns nothing about
 // the server's identity from a packet capture.
+//
+// Deprecated: Use WriteClientHelloV22.
 func WriteClientHelloV21(
 	send func([]byte) error,
 	uuid [UUIDLen]byte,
 	cmd Command,
 	addr Address,
 	serverStaticPub []byte,
+) (*ClientHandshakeState, error) {
+	return writeClientHelloV2x(send, uuid, cmd, addr, serverStaticPub, &v21Suite)
+}
+
+func writeClientHelloV2x(
+	send func([]byte) error,
+	uuid [UUIDLen]byte,
+	cmd Command,
+	addr Address,
+	serverStaticPub []byte,
+	suite *protocolSuite,
 ) (*ClientHandshakeState, error) {
 	if cmd != CommandTCP && cmd != CommandUDP {
 		return nil, ErrCommand
@@ -185,14 +212,14 @@ func WriteClientHelloV21(
 		defer keyWg.Done()
 		x25519Priv, x25519Err = curve.GenerateKey(crand.Reader)
 		if x25519Err != nil {
-			x25519Err = fmt.Errorf("ewp/v2.1: x25519 keygen: %w", x25519Err)
+			x25519Err = fmt.Errorf("%s: x25519 keygen: %w", suite.name, x25519Err)
 		}
 	}()
 	go func() {
 		defer keyWg.Done()
 		mlkemPriv, mlkemErr = mlkem.GenerateKey768()
 		if mlkemErr != nil {
-			mlkemErr = fmt.Errorf("ewp/v2.1: mlkem keygen: %w", mlkemErr)
+			mlkemErr = fmt.Errorf("%s: mlkem keygen: %w", suite.name, mlkemErr)
 		}
 	}()
 	keyWg.Wait()
@@ -210,12 +237,12 @@ func WriteClientHelloV21(
 		Address:   addr,
 	}
 	if _, err := io.ReadFull(crand.Reader, hello.Nonce[:]); err != nil {
-		return nil, fmt.Errorf("ewp/v2.1: nonce rand: %w", err)
+		return nil, fmt.Errorf("%s: nonce rand: %w", suite.name, err)
 	}
 	copy(hello.ClassicalPub[:], x25519Priv.PublicKey().Bytes())
 	pqPub := mlkemPriv.EncapsulationKey().Bytes()
 	if len(pqPub) != MLKEM768PubLen {
-		return nil, fmt.Errorf("ewp/v2.1: unexpected ML-KEM pub size %d", len(pqPub))
+		return nil, fmt.Errorf("%s: unexpected ML-KEM pub size %d", suite.name, len(pqPub))
 	}
 	copy(hello.PQPub[:], pqPub)
 
@@ -225,13 +252,14 @@ func WriteClientHelloV21(
 		x25519Priv: x25519Priv,
 		mlkemPriv:  mlkemPriv,
 		hello:      hello,
+		version:    suite.version,
 	}
-	wire, err := encodeClientHelloV21Internal(hello, x25519Priv, serverStaticPub)
+	wire, err := encodeClientHelloV2xInternal(hello, x25519Priv, serverStaticPub, suite)
 	if err != nil {
 		return nil, err
 	}
 	if err := send(wire); err != nil {
-		return nil, fmt.Errorf("ewp/v2.1: send ClientHello: %w", err)
+		return nil, fmt.Errorf("%s: send ClientHello: %w", suite.name, err)
 	}
 	return state, nil
 }
@@ -250,7 +278,10 @@ func EncodeClientHelloV21Test(
 	if state == nil || state.x25519Priv == nil {
 		return nil, errors.New("ewp/v2.1: nil state or ephemeral key")
 	}
-	return encodeClientHelloV21Internal(state.hello, state.x25519Priv, serverStaticPub)
+	if state.version != protocolVersionV21 {
+		return nil, ErrProtocolVersion
+	}
+	return encodeClientHelloV2xInternal(state.hello, state.x25519Priv, serverStaticPub, &v21Suite)
 }
 
 // encodeClientHelloV21Internal is the wire codec for v2.1.
@@ -263,10 +294,11 @@ func EncodeClientHelloV21Test(
 // cliEphPriv is the X25519 private half of ch.ClassicalPub; it is the
 // only material kept off-wire that lets us compute the static-ECDH
 // share required by the v2.1 KDF.
-func encodeClientHelloV21Internal(
+func encodeClientHelloV2xInternal(
 	ch *ClientHello,
 	cliEphPriv *ecdh.PrivateKey,
 	serverStaticPub []byte,
+	suite *protocolSuite,
 ) ([]byte, error) {
 	if len(serverStaticPub) != X25519PubLen {
 		return nil, ErrStaticPub
@@ -278,10 +310,10 @@ func encodeClientHelloV21Internal(
 	}
 	staticShare, err := cliEphPriv.ECDH(srvPub)
 	if err != nil {
-		return nil, fmt.Errorf("ewp/v2.1: static ECDH: %w", err)
+		return nil, fmt.Errorf("%s: static ECDH: %w", suite.name, err)
 	}
 
-	aeadKey, macKey := deriveV21OuterKeys(staticShare, ch.UUID, ch.Nonce, ch.ClassicalPub)
+	aeadKey, macKey := deriveOuterKeys(suite, staticShare, ch.UUID, ch.Nonce, ch.ClassicalPub)
 	zero(staticShare)
 
 	// Build inner plaintext (same layout as v2.0).
@@ -302,7 +334,7 @@ func encodeClientHelloV21Internal(
 	inner = append(inner, plBuf...)
 	pad := make([]byte, padLen)
 	if _, err := io.ReadFull(crand.Reader, pad); err != nil {
-		return nil, fmt.Errorf("ewp/v2.1: pad rand: %w", err)
+		return nil, fmt.Errorf("%s: pad rand: %w", suite.name, err)
 	}
 	inner = append(inner, pad...)
 
@@ -327,7 +359,7 @@ func encodeClientHelloV21Internal(
 	cipher := aead.Seal(nil, ch.Nonce[:], inner, aad)
 	out = append(out, cipher...)
 
-	mac := v21OuterMAC(macKey, ctLen, out)
+	mac := outerMAC(macKey, ctLen, out)
 	out = append(out, mac[:]...)
 	return out, nil
 }
@@ -371,33 +403,41 @@ func MakeUUIDLookupV21(uuids [][UUIDLen]byte) UUIDLookupV21 {
 // compatibility with calling sites that already hold one; internally
 // we call lookupV21Adapter(lookup) to enumerate UUIDs. New callers
 // should use AcceptClientHelloV21Strict which takes UUIDLookupV21.
+//
+// Deprecated: Use AcceptClientHelloV21Strict or
+// AcceptClientHelloV21WithReplay. The compatibility lookup cannot enumerate
+// candidates and therefore always rejects.
 func AcceptClientHelloV21(
 	msg []byte,
 	lookup UUIDLookup,
 	serverStaticPriv *ecdh.PrivateKey,
 ) (helloOut []byte, result *HandshakeResult, err error) {
-	return acceptClientHelloV21(msg, lookupV21Adapter(lookup), serverStaticPriv, nil)
+	return acceptClientHelloV2x(msg, lookupV21Adapter(lookup), serverStaticPriv, nil, &v21Suite)
 }
 
 // AcceptClientHelloV21Strict is the recommended entrypoint; it takes
 // the v2.1-native UUIDLookupV21.
+//
+// Deprecated: Use AcceptClientHelloV22Strict.
 func AcceptClientHelloV21Strict(
 	msg []byte,
 	lookup UUIDLookupV21,
 	serverStaticPriv *ecdh.PrivateKey,
 ) (helloOut []byte, result *HandshakeResult, err error) {
-	return acceptClientHelloV21(msg, lookup, serverStaticPriv, nil)
+	return acceptClientHelloV2x(msg, lookup, serverStaticPriv, nil, &v21Suite)
 }
 
 // AcceptClientHelloV21WithReplay adds replay-cache integration; same
 // semantics as AcceptClientHelloWithReplay.
+//
+// Deprecated: Use AcceptClientHelloV22WithReplay.
 func AcceptClientHelloV21WithReplay(
 	msg []byte,
 	lookup UUIDLookupV21,
 	serverStaticPriv *ecdh.PrivateKey,
 	cache *ReplayCache,
 ) (helloOut []byte, result *HandshakeResult, err error) {
-	return acceptClientHelloV21(msg, lookup, serverStaticPriv, cache)
+	return acceptClientHelloV2x(msg, lookup, serverStaticPriv, cache, &v21Suite)
 }
 
 // lookupV21Adapter probes the supplied v2.0 UUIDLookup to recover the
@@ -418,11 +458,12 @@ func lookupV21Adapter(lookup UUIDLookup) UUIDLookupV21 {
 	return func() [][UUIDLen]byte { return nil }
 }
 
-func acceptClientHelloV21(
+func acceptClientHelloV2x(
 	msg []byte,
 	lookup UUIDLookupV21,
 	serverStaticPriv *ecdh.PrivateKey,
 	cache *ReplayCache,
+	suite *protocolSuite,
 ) (helloOut []byte, result *HandshakeResult, err error) {
 	if serverStaticPriv == nil {
 		return nil, nil, ErrStaticPriv
@@ -457,7 +498,7 @@ func acceptClientHelloV21(
 	}
 	staticShare, err := serverStaticPriv.ECDH(cliEph)
 	if err != nil {
-		return nil, nil, fmt.Errorf("ewp/v2.1: server static ECDH: %w", err)
+		return nil, nil, fmt.Errorf("%s: server static ECDH: %w", suite.name, err)
 	}
 
 	// Outer MAC verification. We need the UUID first (lookup), but
@@ -468,14 +509,14 @@ func acceptClientHelloV21(
 	var tag [OuterMACLen]byte
 	copy(tag[:], msg[macStart:])
 
-	uuid, err := lookupV21Verify(lookup, msg, tag, staticShare, nonce, cliEphPub, ctLen)
+	uuid, err := lookupV2xVerify(lookup, msg, tag, staticShare, nonce, cliEphPub, ctLen, suite)
 	if err != nil {
 		zero(staticShare)
 		return nil, nil, err
 	}
 
 	// Decrypt inner.
-	aeadKey, _ := deriveV21OuterKeys(staticShare, uuid, nonce, cliEphPub)
+	aeadKey, _ := deriveOuterKeys(suite, staticShare, uuid, nonce, cliEphPub)
 	aead, err := newHandshakeAEAD(aeadKey)
 	if err != nil {
 		zero(staticShare)
@@ -559,24 +600,24 @@ func acceptClientHelloV21(
 		defer cryptoWg.Done()
 		srvX25519Priv, xErr = curve.GenerateKey(crand.Reader)
 		if xErr != nil {
-			xErr = fmt.Errorf("ewp/v2.1: server x25519 keygen: %w", xErr)
+			xErr = fmt.Errorf("%s: server x25519 keygen: %w", suite.name, xErr)
 			return
 		}
 		classical, xErr = srvX25519Priv.ECDH(cliEph)
 		if xErr != nil {
-			xErr = fmt.Errorf("ewp/v2.1: server x25519 ecdh: %w", xErr)
+			xErr = fmt.Errorf("%s: server x25519 ecdh: %w", suite.name, xErr)
 		}
 	}()
 	go func() {
 		defer cryptoWg.Done()
 		cliMLKEMPub, e := mlkem.NewEncapsulationKey768(ch.PQPub[:])
 		if e != nil {
-			mlkemErr = fmt.Errorf("ewp/v2.1: parse client mlkem pub: %w", e)
+			mlkemErr = fmt.Errorf("%s: parse client mlkem pub: %w", suite.name, e)
 			return
 		}
 		pqShared, pqCipher = cliMLKEMPub.Encapsulate()
 		if len(pqCipher) != MLKEM768CipherL {
-			mlkemErr = fmt.Errorf("ewp/v2.1: unexpected ML-KEM cipher size %d", len(pqCipher))
+			mlkemErr = fmt.Errorf("%s: unexpected ML-KEM cipher size %d", suite.name, len(pqCipher))
 		}
 	}()
 	cryptoWg.Wait()
@@ -606,13 +647,13 @@ func acceptClientHelloV21(
 	// ServerHello also bound under the v2.1 MAC chain, so a forged
 	// ServerHello from someone without the static priv cannot pass
 	// the client's verification.
-	helloOut, err = encodeServerHelloV21(sh, uuid, staticShare, nonce, cliEphPub)
+	helloOut, err = encodeServerHelloV2x(sh, uuid, staticShare, nonce, cliEphPub, suite)
 	if err != nil {
 		zero(staticShare)
 		return nil, nil, err
 	}
 
-	keys := DeriveSessionKeys(classicalArr, pqShared, ch.Nonce, sh.NonceEcho)
+	keys := deriveSessionKeys(suite, classicalArr, pqShared, ch.Nonce, sh.NonceEcho)
 	zero(classical)
 	zero(pqShared)
 	zero(staticShare)
@@ -628,7 +669,7 @@ func acceptClientHelloV21(
 //
 // Iteration is linear — typical Service has < 64 users — and uses
 // constant-time hmac.Equal to avoid timing-based UUID enumeration.
-func lookupV21Verify(
+func lookupV2xVerify(
 	lookup UUIDLookupV21,
 	msg []byte,
 	tag [OuterMACLen]byte,
@@ -636,13 +677,14 @@ func lookupV21Verify(
 	nonce [HandshakeNonce]byte,
 	cliEphPub [X25519PubLen]byte,
 	ctLen int,
+	suite *protocolSuite,
 ) ([UUIDLen]byte, error) {
 	macStart := len(msg) - OuterMACLen
 	wire := msg[:macStart]
 	uuids := lookup()
 	for _, u := range uuids {
-		_, macKey := deriveV21OuterKeys(staticShare, u, nonce, cliEphPub)
-		want := v21OuterMAC(macKey, ctLen, wire)
+		_, macKey := deriveOuterKeys(suite, staticShare, u, nonce, cliEphPub)
+		want := outerMAC(macKey, ctLen, wire)
 		if hmac.Equal(want[:], tag[:]) {
 			return u, nil
 		}
@@ -654,12 +696,13 @@ func lookupV21Verify(
 // ServerHello v2.1 codec — MAC bound under v2.1 chain.
 // ----------------------------------------------------------------------
 
-func encodeServerHelloV21(
+func encodeServerHelloV2x(
 	sh *ServerHello,
 	uuid [UUIDLen]byte,
 	staticShare []byte,
 	nonce [HandshakeNonce]byte,
 	cliEphPub [X25519PubLen]byte,
+	suite *protocolSuite,
 ) ([]byte, error) {
 	out := make([]byte, 0, HandshakeNonce+X25519PubLen+MLKEM768CipherL+4+1+OuterMACLen)
 	out = append(out, sh.NonceEcho[:]...)
@@ -670,8 +713,8 @@ func encodeServerHelloV21(
 	out = append(out, stBuf...)
 	out = append(out, sh.Status)
 
-	_, macKey := deriveV21OuterKeys(staticShare, uuid, nonce, cliEphPub)
-	mac := v21OuterMAC(macKey, len(out), out)
+	_, macKey := deriveOuterKeys(suite, staticShare, uuid, nonce, cliEphPub)
+	mac := outerMAC(macKey, len(out), out)
 	out = append(out, mac[:]...)
 	return out, nil
 }
@@ -680,10 +723,23 @@ func encodeServerHelloV21(
 // ClientHandshakeState. It re-derives the static ECDH share from the
 // state's stored ephemeral private and the supplied serverStaticPub,
 // then verifies the v2.1 MAC.
+//
+// Deprecated: Use ReadServerHelloV22.
 func (s *ClientHandshakeState) ReadServerHelloV21(
 	msg []byte,
 	serverStaticPub []byte,
 ) (*HandshakeResult, error) {
+	return s.readServerHelloV2x(msg, serverStaticPub, &v21Suite)
+}
+
+func (s *ClientHandshakeState) readServerHelloV2x(
+	msg []byte,
+	serverStaticPub []byte,
+	suite *protocolSuite,
+) (*HandshakeResult, error) {
+	if s.version != suite.version {
+		return nil, ErrProtocolVersion
+	}
 	if len(serverStaticPub) != X25519PubLen {
 		return nil, ErrStaticPub
 	}
@@ -693,11 +749,11 @@ func (s *ClientHandshakeState) ReadServerHelloV21(
 		return nil, fmt.Errorf("%w: %v", ErrStaticPub, err)
 	}
 	if s.x25519Priv == nil {
-		return nil, errors.New("ewp/v2.1: handshake state has no ephemeral key")
+		return nil, fmt.Errorf("%s: handshake state has no ephemeral key", suite.name)
 	}
 	staticShare, err := s.x25519Priv.ECDH(srvPub)
 	if err != nil {
-		return nil, fmt.Errorf("ewp/v2.1: client static ECDH: %w", err)
+		return nil, fmt.Errorf("%s: client static ECDH: %w", suite.name, err)
 	}
 	defer zero(staticShare)
 
@@ -709,8 +765,8 @@ func (s *ClientHandshakeState) ReadServerHelloV21(
 	var tag [OuterMACLen]byte
 	copy(tag[:], msg[macOff:])
 
-	_, macKey := deriveV21OuterKeys(staticShare, s.uuid, s.nonce, s.hello.ClassicalPub)
-	want := v21OuterMAC(macKey, macOff, msg[:macOff])
+	_, macKey := deriveOuterKeys(suite, staticShare, s.uuid, s.nonce, s.hello.ClassicalPub)
+	want := outerMAC(macKey, macOff, msg[:macOff])
 	if !hmac.Equal(want[:], tag[:]) {
 		return nil, ErrOuterMAC
 	}
@@ -740,7 +796,7 @@ func (s *ClientHandshakeState) ReadServerHelloV21(
 
 	srvEphPub, err := curve.NewPublicKey(sh.ClassicalPub[:])
 	if err != nil {
-		return nil, fmt.Errorf("ewp/v2.1: parse server ephemeral x25519 pub: %w", err)
+		return nil, fmt.Errorf("%s: parse server ephemeral x25519 pub: %w", suite.name, err)
 	}
 	// Parallelize the ephemeral X25519 ECDH and the ML-KEM-768
 	// decapsulation — they are cryptographically independent, so both
@@ -757,14 +813,14 @@ func (s *ClientHandshakeState) ReadServerHelloV21(
 		defer cryptoWg.Done()
 		classical, ecdhErr = s.x25519Priv.ECDH(srvEphPub)
 		if ecdhErr != nil {
-			ecdhErr = fmt.Errorf("ewp/v2.1: ephemeral x25519 ecdh: %w", ecdhErr)
+			ecdhErr = fmt.Errorf("%s: ephemeral x25519 ecdh: %w", suite.name, ecdhErr)
 		}
 	}()
 	go func() {
 		defer cryptoWg.Done()
 		pq, decapErr = s.mlkemPriv.Decapsulate(sh.PQCipher[:])
 		if decapErr != nil {
-			decapErr = fmt.Errorf("ewp/v2.1: mlkem decapsulate: %w", decapErr)
+			decapErr = fmt.Errorf("%s: mlkem decapsulate: %w", suite.name, decapErr)
 		}
 	}()
 	cryptoWg.Wait()
@@ -783,7 +839,7 @@ func (s *ClientHandshakeState) ReadServerHelloV21(
 	var classicalArr [X25519PubLen]byte
 	copy(classicalArr[:], classical)
 
-	keys := DeriveSessionKeys(classicalArr, pq, s.hello.Nonce, sh.NonceEcho)
+	keys := deriveSessionKeys(suite, classicalArr, pq, s.hello.Nonce, sh.NonceEcho)
 
 	zero(classical)
 	zero(pq)

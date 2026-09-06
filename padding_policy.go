@@ -1,7 +1,9 @@
 package ewp
 
 import (
-	mrand "math/rand/v2"
+	crand "crypto/rand"
+	"encoding/binary"
+	"io"
 )
 
 // Padding policy for SecureStream-level frames (v0.2.x).
@@ -115,7 +117,10 @@ const (
 // rawWireLen here means the wire size BEFORE pad bytes are added,
 // i.e. frameHeaderSize + len(meta) + cipherLen.
 func padToBucket(rawWireLen int, ladder []int) int {
-	const maxWire = MaxFrameSize - 4 // FrameLen field itself is outside frameLen.
+	return padToBucketForMax(rawWireLen, ladder, MaxFrameSize-4)
+}
+
+func padToBucketForMax(rawWireLen int, ladder []int, maxWire int) int {
 
 	// Find smallest bucket >= rawWireLen whose distance is reachable
 	// within one frame's MaxFramePad budget. (Without this guard, a
@@ -187,10 +192,53 @@ func padToBucket(rawWireLen int, ladder []int) int {
 //
 //	frameHeaderSize + len(meta) + len(payload) + chacha20poly1305.Overhead
 func suggestStreamPad(rawWireLen, phaseFrameIndex int) int {
+	return suggestStreamPadForMax(rawWireLen, phaseFrameIndex, MaxFrameSize-4)
+}
+
+// suggestStreamPadV22 applies the same traffic-shaping distribution to the
+// complete v2.2 record length, including its cleartext outer length field.
+func suggestStreamPadV22(rawWireLen, phaseFrameIndex int) int {
 	if phaseFrameIndex < handshakePhaseFrames {
-		return suggestHandshakePad(rawWireLen, phaseFrameIndex)
+		return suggestHandshakePadV22(rawWireLen, phaseFrameIndex)
 	}
-	return padToBucket(rawWireLen, steadyBuckets)
+	return padToBucketForMax(rawWireLen, steadyBuckets, MaxV22RecordSize)
+}
+
+// suggestHandshakePadV22 prefers the phase-specific handshake floor only when
+// a corresponding bucket is reachable. Unlike the legacy planner, it never
+// clamps an unreachable floor to raw+MaxFramePad because that produces an
+// orphan visible length with a near-exact relationship to the plaintext.
+func suggestHandshakePadV22(rawWireLen, phaseFrameIndex int) int {
+	floor := handshakeFloor(phaseFrameIndex)
+	idx := -1
+	for i, bucket := range steadyBuckets {
+		if bucket >= floor && bucket >= rawWireLen && bucket-rawWireLen <= MaxFramePad {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		return padToBucketForMax(rawWireLen, steadyBuckets, MaxV22RecordSize)
+	}
+
+	target := steadyBuckets[idx]
+	if idx+1 < len(steadyBuckets) &&
+		steadyBuckets[idx+1]-rawWireLen <= MaxFramePad &&
+		secureRandIntn(10000) < bucketUpProbBP {
+		target = steadyBuckets[idx+1]
+	}
+	if target-rawWireLen+jitterWithinBucket <= MaxFramePad &&
+		target+jitterWithinBucket <= MaxV22RecordSize {
+		target += secureRandIntn(jitterWithinBucket)
+	}
+	return target - rawWireLen
+}
+
+func suggestStreamPadForMax(rawWireLen, phaseFrameIndex, maxWire int) int {
+	if phaseFrameIndex < handshakePhaseFrames {
+		return suggestHandshakePadForMax(rawWireLen, phaseFrameIndex, maxWire)
+	}
+	return padToBucketForMax(rawWireLen, steadyBuckets, maxWire)
 }
 
 // suggestHandshakePad shapes an opening-phase frame toward a per-
@@ -204,6 +252,10 @@ func suggestStreamPad(rawWireLen, phaseFrameIndex int) int {
 // flight); a tiny inner record is lifted as far as one frame permits
 // and the rest of the silhouette is carried by the following frames.
 func suggestHandshakePad(rawWireLen, phaseFrameIndex int) int {
+	return suggestHandshakePadForMax(rawWireLen, phaseFrameIndex, MaxFrameSize-4)
+}
+
+func suggestHandshakePadForMax(rawWireLen, phaseFrameIndex, maxWire int) int {
 	floor := handshakeFloor(phaseFrameIndex)
 
 	raw := rawWireLen
@@ -218,7 +270,7 @@ func suggestHandshakePad(rawWireLen, phaseFrameIndex int) int {
 	// Bucketise the (possibly lifted) size on the steady ladder, then
 	// express the answer as pad relative to the ORIGINAL rawWireLen and
 	// clamp to MaxFramePad so EncodeFrame never rejects it.
-	pad := padToBucket(raw, steadyBuckets) + (raw - rawWireLen)
+	pad := padToBucketForMax(raw, steadyBuckets, maxWire) + (raw - rawWireLen)
 	if pad > MaxFramePad {
 		pad = MaxFramePad
 	}
@@ -244,22 +296,28 @@ func handshakeFloor(pos int) int {
 
 // secureRandIntn returns a value in [0, n).
 //
-// We use math/rand/v2's global generator, which is seeded once from
-// the operating system entropy and backed by ChaCha8 (cryptographic
-// strength). It is goroutine-safe, lock-free, and allocation-free —
-// the right tradeoff for a per-frame jitter / bucket-up coin flip
-// that runs on the data-plane hot path. The previous crypto/rand
-// path cost ~43 ns and 1 allocation per call; this is ~3 ns and 0
-// allocations, and is called up to twice per frame.
+// It uses crypto/rand because the choice is observable through frame sizes
+// and timing. This is not key material, but predictable choices still make
+// traffic analysis easier.
 //
-// SECURITY NOTE: the output of this function is NEVER a key, nonce,
-// or anything an adversary can directly observe in cleartext. It
-// only chooses (a) whether to bucket-up, and (b) how many random pad
-// bytes to insert. The pad bytes themselves are still drawn from
-// crypto/rand inside EncodeFrame.
+// SECURITY NOTE: the output of this function is never key or nonce material.
+// Its effects are observable in frame size and timing, which is why this path
+// uses crypto/rand. The pad bytes themselves are also drawn from crypto/rand
+// inside EncodeFrame.
 func secureRandIntn(n int) int {
 	if n <= 1 {
 		return 0
 	}
-	return int(mrand.Uint32N(uint32(n)))
+	bound := uint64(n)
+	threshold := -bound % bound
+	for {
+		var b [8]byte
+		if _, err := io.ReadFull(crand.Reader, b[:]); err != nil {
+			return 0
+		}
+		r := binary.BigEndian.Uint64(b[:])
+		if r >= threshold {
+			return int(r % bound)
+		}
+	}
 }

@@ -1,6 +1,8 @@
 package ewp
 
 import (
+	"bytes"
+	"io"
 	"sync"
 	"testing"
 	"time"
@@ -52,6 +54,88 @@ func (c *syncCapture) count() int {
 	return len(c.frames)
 }
 
+// orderedCapture holds its first send open while allowing a second send to
+// proceed. It makes a missing shaper send serialisation deterministic.
+type orderedCapture struct {
+	mu            sync.Mutex
+	frames        [][]byte
+	firstInFlight bool
+	firstStarted  chan struct{}
+	releaseFirst  chan struct{}
+}
+
+func (c *orderedCapture) SendMessage(b []byte) error {
+	cp := append([]byte(nil), b...)
+	c.mu.Lock()
+	first := !c.firstInFlight && len(c.frames) == 0
+	if first {
+		c.firstInFlight = true
+		close(c.firstStarted)
+	}
+	c.mu.Unlock()
+	if first {
+		<-c.releaseFirst
+	}
+	c.mu.Lock()
+	c.frames = append(c.frames, cp)
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *orderedCapture) ReadMessage() ([]byte, error) { select {} }
+func (c *orderedCapture) Close() error                 { return nil }
+
+func (c *orderedCapture) snapshot() [][]byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	frames := make([][]byte, len(c.frames))
+	for i, frame := range c.frames {
+		frames[i] = append([]byte(nil), frame...)
+	}
+	return frames
+}
+
+type shaperFailingTransport struct {
+	sendStarted chan struct{}
+	once        sync.Once
+}
+
+func (t *shaperFailingTransport) SendMessage([]byte) error {
+	t.once.Do(func() { close(t.sendStarted) })
+	return io.ErrClosedPipe
+}
+func (t *shaperFailingTransport) ReadMessage() ([]byte, error) { return nil, io.EOF }
+func (t *shaperFailingTransport) Close() error                 { return nil }
+
+type shaperBlockingTransport struct {
+	sendStarted chan struct{}
+	closed      chan struct{}
+	sendOnce    sync.Once
+	closeOnce   sync.Once
+}
+
+func (t *shaperBlockingTransport) SendMessage([]byte) error {
+	t.sendOnce.Do(func() { close(t.sendStarted) })
+	<-t.closed
+	return io.ErrClosedPipe
+}
+func (t *shaperBlockingTransport) ReadMessage() ([]byte, error) { return nil, io.EOF }
+func (t *shaperBlockingTransport) Close() error {
+	t.closeOnce.Do(func() { close(t.closed) })
+	return nil
+}
+
+func newShaperSendStream(t *testing.T, tr MessageTransport) *SecureStream {
+	t.Helper()
+	key := hardRandKey()
+	prefix := hardRandPrefix()
+	send, err := NewFrameAEAD(key, prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &SecureStream{tr: tr, send: send}
+}
+
 // TestShaper_CoalescesBurst verifies that a rapid burst of small
 // writes collapses into fewer frames than writes, so the on-wire frame
 // COUNT no longer mirrors the inner record count.
@@ -95,6 +179,123 @@ func TestShaper_NoCoalesceWhenDisabled(t *testing.T) {
 	}
 	if got := cap.count(); got != 5 {
 		t.Fatalf("disabled shaper should pass through 1:1, got %d frames", got)
+	}
+}
+
+func TestShaper_AsyncFlushFailureRejectsLaterWrites(t *testing.T) {
+	tr := &shaperFailingTransport{sendStarted: make(chan struct{})}
+	sh := NewStreamShaper(newShaperSendStream(t, tr), ShaperConfig{FlushDelay: time.Millisecond})
+	defer sh.Close()
+	if err := sh.WriteTCP([]byte("first")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-tr.sendStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timer flush did not reach transport")
+	}
+	deadline := time.Now().Add(time.Second)
+	for !sh.stopped.Load() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !sh.stopped.Load() {
+		t.Fatal("timer flush failure did not stop shaper")
+	}
+	if err := sh.WriteTCP([]byte("later")); err == nil {
+		t.Fatal("write after asynchronous flush failure unexpectedly succeeded")
+	}
+}
+
+func TestStreamConnCloseUnblocksCoverWrite(t *testing.T) {
+	tr := &shaperBlockingTransport{
+		sendStarted: make(chan struct{}),
+		closed:      make(chan struct{}),
+	}
+	stream := newShaperSendStream(t, tr)
+	conn := &streamConn{SecureStream: stream}
+	conn.shaper = NewStreamShaper(stream, ShaperConfig{
+		FlushDelay:       time.Hour,
+		CoverIdleAfter:   time.Millisecond,
+		CoverMinInterval: time.Millisecond,
+		CoverMaxInterval: time.Millisecond,
+		CoverMaxPad:      1,
+	})
+	if _, err := conn.Write([]byte("buffered")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-tr.sendStarted:
+	case <-time.After(time.Second):
+		t.Fatal("cover write did not reach blocking transport")
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- conn.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("streamConn.Close blocked behind cover write")
+	}
+	if _, err := conn.Write([]byte("after-close")); err == nil {
+		t.Fatal("write after Close unexpectedly succeeded")
+	}
+}
+
+func TestShaper_PreservesFlushOrderOnSlowTransport(t *testing.T) {
+	key := hardRandKey()
+	prefix := hardRandPrefix()
+	send, err := NewFrameAEAD(key, prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec, err := NewFrameAEAD(key, prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cap := &orderedCapture{
+		firstStarted: make(chan struct{}),
+		releaseFirst: make(chan struct{}),
+	}
+	stream := &SecureStream{tr: cap, send: send}
+	sh := NewStreamShaper(stream, ShaperConfig{FlushDelay: time.Hour, MaxCoalesce: 1})
+	defer sh.Close()
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- sh.WriteTCP([]byte("first")) }()
+	select {
+	case <-cap.firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first flush did not reach transport")
+	}
+
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- sh.WriteTCP([]byte("second")) }()
+	close(cap.releaseFirst)
+	for _, done := range []chan error{firstDone, secondDone} {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("flush did not complete")
+		}
+	}
+
+	frames := cap.snapshot()
+	if len(frames) != 2 {
+		t.Fatalf("got %d frames, want 2", len(frames))
+	}
+	for i, want := range [][]byte{[]byte("first"), []byte("second")} {
+		frame, err := DecodeFrame(bytes.NewReader(frames[i]), dec)
+		if err != nil {
+			t.Fatalf("decode frame %d: %v", i, err)
+		}
+		if !bytes.Equal(frame.Payload, want) {
+			t.Fatalf("frame %d payload = %q, want %q", i, frame.Payload, want)
+		}
 	}
 }
 

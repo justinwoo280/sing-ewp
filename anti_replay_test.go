@@ -7,7 +7,7 @@ import (
 )
 
 func TestReplayCache_FirstSeenAdmits(t *testing.T) {
-	c := NewReplayCache(time.Second)
+	c := newReplayCache(time.Second)
 	t.Cleanup(c.Close)
 	var u [UUIDLen]byte
 	var n [HandshakeNonce]byte
@@ -19,7 +19,7 @@ func TestReplayCache_FirstSeenAdmits(t *testing.T) {
 }
 
 func TestReplayCache_SecondSeenRejects(t *testing.T) {
-	c := NewReplayCache(time.Second)
+	c := newReplayCache(time.Second)
 	t.Cleanup(c.Close)
 	var u [UUIDLen]byte
 	var n [HandshakeNonce]byte
@@ -32,7 +32,7 @@ func TestReplayCache_SecondSeenRejects(t *testing.T) {
 }
 
 func TestReplayCache_DistinctNoncesIndependent(t *testing.T) {
-	c := NewReplayCache(time.Second)
+	c := newReplayCache(time.Second)
 	t.Cleanup(c.Close)
 	var u [UUIDLen]byte
 	var n1, n2 [HandshakeNonce]byte
@@ -46,7 +46,7 @@ func TestReplayCache_DistinctNoncesIndependent(t *testing.T) {
 }
 
 func TestReplayCache_DistinctUUIDsIndependent(t *testing.T) {
-	c := NewReplayCache(time.Second)
+	c := newReplayCache(time.Second)
 	t.Cleanup(c.Close)
 	var u1, u2 [UUIDLen]byte
 	u2[0] = 0xff
@@ -60,10 +60,8 @@ func TestReplayCache_DistinctUUIDsIndependent(t *testing.T) {
 }
 
 func TestReplayCache_ExpiryReadmits(t *testing.T) {
-	// Window of 1 second; the entry's expiry is computed from
-	// time.Now().Unix(), so we must wait > 1 full second of wall
-	// clock to be sure we cross the boundary.
-	c := NewReplayCache(time.Second)
+	// Wait past the monotonic expiry boundary before retrying the key.
+	c := newReplayCache(time.Second)
 	t.Cleanup(c.Close)
 	var u [UUIDLen]byte
 	var n [HandshakeNonce]byte
@@ -73,6 +71,44 @@ func TestReplayCache_ExpiryReadmits(t *testing.T) {
 	time.Sleep(1100 * time.Millisecond)
 	if !c.MarkSeenOrReject(u, n) {
 		t.Fatal("after window expiry, the same pair should re-admit")
+	}
+	if got := c.Len(); got != 1 {
+		t.Fatalf("expired entry must be replaced, got %d entries", got)
+	}
+}
+
+func TestReplayCache_CapacityReservationIsAtomic(t *testing.T) {
+	c := newReplayCache(time.Minute)
+	t.Cleanup(c.Close)
+	c.total.Store(uint64(maxReplayEntries - 1))
+
+	const workers = 64
+	var wg sync.WaitGroup
+	var admits int
+	var admitsMu sync.Mutex
+	start := make(chan struct{})
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			var u [UUIDLen]byte
+			u[0] = byte(i + 1)
+			if c.MarkSeenOrReject(u, [HandshakeNonce]byte{}) {
+				admitsMu.Lock()
+				admits++
+				admitsMu.Unlock()
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	if admits != 1 {
+		t.Fatalf("capacity boundary admitted %d entries, want 1", admits)
+	}
+	if got := c.Len(); got != maxReplayEntries {
+		t.Fatalf("capacity counter = %d, want %d", got, maxReplayEntries)
 	}
 }
 
@@ -113,7 +149,7 @@ func TestReplayCache_ConcurrentAdmitsRaceFree(t *testing.T) {
 func TestReplayCache_GCEvictsExpired(t *testing.T) {
 	// Force enough admits to trigger the opportunistic sweep, then
 	// verify Len shrinks back to roughly the live-set size.
-	c := NewReplayCache(20 * time.Millisecond)
+	c := newReplayCache(20 * time.Millisecond)
 	t.Cleanup(c.Close)
 	var u [UUIDLen]byte
 	var n [HandshakeNonce]byte

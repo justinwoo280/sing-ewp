@@ -43,14 +43,19 @@ type MessageTransport interface {
 // Concurrency model:
 //   - Send / SendUDP / SendUDPNew / SendUDPEnd / SendProbeReq / SendProbeResp
 //     are safe for concurrent calls (serialised internally by writeMu).
-//   - Recv MUST be called from a single goroutine (it advances the
-//     receive AEAD counter; concurrent calls would race on counter).
+//   - Recv calls are serialized internally; callers should still use one
+//     reader for predictable application ordering.
 //   - Close is idempotent and safe from any goroutine; it interrupts
 //     any in-flight Recv by closing the underlying transport.
 type SecureStream struct {
 	tr MessageTransport
 
+	// version selects the record codec and rekey domain. The zero value keeps
+	// legacy streams on the existing clear-header codec for compatibility.
+	version protocolVersion
+
 	writeMu sync.Mutex
+	recvMu  sync.Mutex
 	send    *FrameAEAD
 	recv    *FrameAEAD
 
@@ -62,19 +67,29 @@ type SecureStream struct {
 	bytesOut atomic.Uint64
 	frmIn    atomic.Uint64
 	frmOut   atomic.Uint64
-
-	// Rekey bookkeeping. prevSendKey holds the immediately-preceding
-	// send key for test introspection; the production data path never
-	// reads it. hasPrevSendKey is true once at least one Rekey has
-	// occurred. Both fields are guarded by writeMu.
-	prevSendKey    [AEADKeyLen]byte
-	hasPrevSendKey bool
 }
 
 // NewClientSecureStream wraps the post-handshake state on the client
 // side. send is the c2s FrameAEAD (uses keys.C2SKey/C2SNonce); recv is
 // the s2c side.
 func NewClientSecureStream(tr MessageTransport, keys SessionKeys) (*SecureStream, error) {
+	if keys.version == protocolVersionV22 {
+		return nil, ErrProtocolVersion
+	}
+	return newClientSecureStream(tr, keys, protocolVersionLegacy)
+}
+
+// NewClientSecureStreamV22 builds an opaque-record v2.2 stream. Its keys must
+// come from the v2.2 handshake/session derivation; this constructor never
+// attempts the v2.1 frame codec as a fallback.
+func NewClientSecureStreamV22(tr MessageTransport, keys SessionKeys) (*SecureStream, error) {
+	if keys.version != protocolVersionV22 {
+		return nil, ErrProtocolVersion
+	}
+	return newClientSecureStream(tr, keys, protocolVersionV22)
+}
+
+func newClientSecureStream(tr MessageTransport, keys SessionKeys, version protocolVersion) (*SecureStream, error) {
 	send, err := NewFrameAEAD(keys.C2SKey, keys.C2SNonce)
 	if err != nil {
 		return nil, err
@@ -83,12 +98,29 @@ func NewClientSecureStream(tr MessageTransport, keys SessionKeys) (*SecureStream
 	if err != nil {
 		return nil, err
 	}
-	return &SecureStream{tr: tr, send: send, recv: recv}, nil
+	return &SecureStream{tr: tr, version: version, send: send, recv: recv}, nil
 }
 
 // NewServerSecureStream wraps the post-handshake state on the server
 // side. The send/recv directions are mirrored versus the client.
 func NewServerSecureStream(tr MessageTransport, keys SessionKeys) (*SecureStream, error) {
+	if keys.version == protocolVersionV22 {
+		return nil, ErrProtocolVersion
+	}
+	return newServerSecureStream(tr, keys, protocolVersionLegacy)
+}
+
+// NewServerSecureStreamV22 builds an opaque-record v2.2 stream. Its keys must
+// come from the v2.2 handshake/session derivation; this constructor never
+// attempts the v2.1 frame codec as a fallback.
+func NewServerSecureStreamV22(tr MessageTransport, keys SessionKeys) (*SecureStream, error) {
+	if keys.version != protocolVersionV22 {
+		return nil, ErrProtocolVersion
+	}
+	return newServerSecureStream(tr, keys, protocolVersionV22)
+}
+
+func newServerSecureStream(tr MessageTransport, keys SessionKeys, version protocolVersion) (*SecureStream, error) {
 	send, err := NewFrameAEAD(keys.S2CKey, keys.S2CNonce)
 	if err != nil {
 		return nil, err
@@ -97,7 +129,7 @@ func NewServerSecureStream(tr MessageTransport, keys SessionKeys) (*SecureStream
 	if err != nil {
 		return nil, err
 	}
-	return &SecureStream{tr: tr, send: send, recv: recv}, nil
+	return &SecureStream{tr: tr, version: version, send: send, recv: recv}, nil
 }
 
 // ----------------------------------------------------------------------
@@ -114,35 +146,106 @@ func NewServerSecureStream(tr MessageTransport, keys SessionKeys) (*SecureStream
 // the payload-to-wire mapping is non-monotonic) and a small jitter
 // inside each bucket (so the wire-size histogram is not a discrete
 // set of spikes). See padding_policy.go.
-func (s *SecureStream) sendFrame(t FrameType, meta, payload []byte, padLen int) error {
+func (s *SecureStream) sendFrame(t FrameType, meta, payload []byte, padLen int) (err error) {
 	if s.closed.Load() {
 		return io.ErrClosedPipe
 	}
 	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-
-	if padLen < 0 {
-		// rawWireLen = header + meta + cipher(meta||payload) so the
-		// ladder bucketises the actual on-wire frame size.
-		cipherLen := len(meta) + len(payload) + chacha20poly1305.Overhead
-		rawWireLen := frameHeaderSize + cipherLen
-		phaseIdx := int(s.frmOut.Load())
-		padLen = suggestStreamPad(rawWireLen, phaseIdx)
+	wipeRecv := false
+	defer func() {
+		s.writeMu.Unlock()
+		if wipeRecv {
+			s.recvMu.Lock()
+			s.wipeRecvLocked()
+			s.recvMu.Unlock()
+		}
+	}()
+	if s.closed.Load() || s.send == nil {
+		return io.ErrClosedPipe
 	}
+
+	padLen = s.selectRecordPad(meta, payload, padLen)
 
 	var buf bytes.Buffer
 	buf.Grow(frameHeaderSize + len(meta) + len(payload) + 16 + 2 + padLen)
-	if err := EncodeFrame(&buf, s.send, t, meta, payload, padLen); err != nil {
+	if err := s.encodeRecord(&buf, t, meta, payload, padLen); err != nil {
 		return fmt.Errorf("ewp/v2: encode %s frame: %w", frameTypeName(t), err)
 	}
 	wire := buf.Bytes()
 	if err := s.tr.SendMessage(wire); err != nil {
-		s.closeUnderlying()
+		s.abortTransport()
+		s.wipeSendLocked()
+		wipeRecv = true
 		return fmt.Errorf("ewp/v2: transport send: %w", err)
 	}
 	s.bytesOut.Add(uint64(len(wire)))
 	s.frmOut.Add(1)
 	return nil
+}
+
+// wipeSendLocked and wipeRecvLocked clear the frame contexts while their
+// respective mutex is held.
+func (s *SecureStream) wipeSendLocked() {
+	if s.send != nil {
+		s.send.wipe()
+		s.send = nil
+	}
+}
+
+func (s *SecureStream) wipeRecvLocked() {
+	if s.recv != nil {
+		s.recv.wipe()
+		s.recv = nil
+	}
+}
+
+func (s *SecureStream) usesV22Records() bool {
+	return s.version == protocolVersionV22
+}
+
+func (s *SecureStream) recordRawWireLen(meta, payload []byte) int {
+	if s.usesV22Records() {
+		return v22OuterLengthSize + v22InnerHeaderSize + len(meta) + len(payload) + chacha20poly1305.Overhead
+	}
+	return frameHeaderSize + len(meta) + len(payload) + chacha20poly1305.Overhead
+}
+
+func (s *SecureStream) selectRecordPad(meta, payload []byte, requested int) int {
+	rawWireLen := s.recordRawWireLen(meta, payload)
+	phaseIdx := int(s.frmOut.Load())
+	if !s.usesV22Records() {
+		if requested < 0 {
+			return suggestStreamPad(rawWireLen, phaseIdx)
+		}
+		return requested
+	}
+	if requested < 0 {
+		return suggestStreamPadV22(rawWireLen, phaseIdx)
+	}
+	if requested > MaxFramePad {
+		return requested
+	}
+	// Explicit cover padding is a minimum. Add bucket padding so its visible
+	// record length follows the same v2.2 distribution as application frames.
+	extra := suggestStreamPadV22(rawWireLen+requested, phaseIdx)
+	if extra > MaxFramePad-requested {
+		extra = MaxFramePad - requested
+	}
+	return requested + extra
+}
+
+func (s *SecureStream) encodeRecord(w io.Writer, t FrameType, meta, payload []byte, padLen int) error {
+	if s.usesV22Records() {
+		return encodeFrameV22WithPad(w, s.send, t, meta, payload, padLen)
+	}
+	return EncodeFrame(w, s.send, t, meta, payload, padLen)
+}
+
+func (s *SecureStream) decodeRecord(r io.Reader) (*DecodedFrame, error) {
+	if s.usesV22Records() {
+		return DecodeFrameV22(r, s.recv)
+	}
+	return DecodeFrame(r, s.recv)
 }
 
 // SendTCPData sends a chunk of TCP payload bytes.
@@ -216,10 +319,11 @@ func (s *SecureStream) SendCoverPad(padLen int) error {
 }
 
 // ----------------------------------------------------------------------
-// Rekey: derives a fresh per-direction key from the current key plus
-// the running counter, providing forward secrecy of the *session* keys
-// (an attacker who later compromises the new key cannot decrypt
-// pre-rekey ciphertext, because the chain is one-way under HKDF).
+// Rekey evolves a fresh per-direction key from the current key plus the
+// running counter. It provides backward secrecy for prior epochs: an attacker
+// who later compromises the new key cannot derive pre-rekey keys from the
+// one-way HKDF chain. It does not provide post-compromise recovery because it
+// introduces no fresh shared entropy.
 //
 // Wire protocol:
 //
@@ -247,39 +351,36 @@ func (s *SecureStream) SendCoverPad(padLen int) error {
 // a different label without aliasing.
 const rekeyLabel = "ewp/v2 rekey direction"
 
-// previousSendKey holds the most recent pre-rekey send key for tests
-// that wish to assert forward-secrecy properties. In production this
-// is a one-way derivation (HKDF-Expand) so the previous key is not
-// recoverable from the current state; the field is only populated
-// when the rekey path runs and is overwritten on each rotation.
-//
-// Stored as part of SecureStream rather than a global so concurrent
-// streams in the same process do not interfere.
-//
-// Test-only accessor: PreviousSendKey().
-//
-// We deliberately do NOT keep the entire history; only the immediate
-// predecessor is retained.
-
 // Rekey rotates the per-direction send key and emits a FrameRekeyReq
 // announcing the rotation to the peer.
 //
 // After Rekey returns successfully, every subsequent send frame uses
-// the new key; the old key is dropped (only PreviousSendKey() remains
-// for test introspection).
-func (s *SecureStream) Rekey() error {
+// the new key and the old key material is wiped on a best-effort basis. Call
+// Rekey before the current frame counter is exhausted.
+func (s *SecureStream) Rekey() (err error) {
 	if s.closed.Load() {
 		return io.ErrClosedPipe
 	}
 	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
+	wipeRecv := false
+	defer func() {
+		s.writeMu.Unlock()
+		if wipeRecv {
+			s.recvMu.Lock()
+			s.wipeRecvLocked()
+			s.recvMu.Unlock()
+		}
+	}()
+	if s.send == nil || s.send.aead == nil {
+		return io.ErrClosedPipe
+	}
 
 	preCounter := s.send.counter
 	preKey := s.send.key
 	prePrefix := s.send.prefix
 
 	// Derive new key + nonce-prefix from (oldKey, label, counter).
-	newKey, newPrefix := deriveRekey(preKey, prePrefix, preCounter)
+	newKey, newPrefix := s.deriveRekey(preKey, prePrefix, preCounter)
 
 	// Encode and send the rekey announce under the OLD AEAD. The
 	// payload carries the pre-rekey counter so a recv side that
@@ -292,11 +393,18 @@ func (s *SecureStream) Rekey() error {
 		preCounter >>= 8
 	}
 	var buf bytes.Buffer
-	if err := EncodeFrame(&buf, s.send, FrameRekeyReq, nil, counterBE[:], 0); err != nil {
+	padLen := s.selectRecordPad(nil, counterBE[:], 0)
+	if err := s.encodeRecord(&buf, FrameRekeyReq, nil, counterBE[:], padLen); err != nil {
 		return fmt.Errorf("ewp/v2: encode rekey: %w", err)
 	}
 	if err := s.tr.SendMessage(buf.Bytes()); err != nil {
-		s.closeUnderlying()
+		s.abortTransport()
+		s.wipeSendLocked()
+		zero(preKey[:])
+		zero(prePrefix[:])
+		zero(newKey[:])
+		zero(newPrefix[:])
+		wipeRecv = true
 		return fmt.Errorf("ewp/v2: transport send rekey: %w", err)
 	}
 	s.bytesOut.Add(uint64(buf.Len()))
@@ -305,34 +413,26 @@ func (s *SecureStream) Rekey() error {
 	// Swap in the new AEAD. Counter resets to 0 under the new key.
 	newAEAD, err := NewFrameAEAD(newKey, newPrefix)
 	if err != nil {
+		s.abortTransport()
+		s.wipeSendLocked()
+		zero(preKey[:])
+		zero(prePrefix[:])
+		zero(newKey[:])
+		zero(newPrefix[:])
+		wipeRecv = true
 		return fmt.Errorf("ewp/v2: build rekeyed AEAD: %w", err)
 	}
-	s.prevSendKey = preKey
-	s.hasPrevSendKey = true
+	oldAEAD := s.send
 	s.send = newAEAD
+	oldAEAD.wipe()
+	zero(preKey[:])
+	zero(prePrefix[:])
+	zero(newKey[:])
+	zero(newPrefix[:])
 	return nil
 }
 
-// PreviousSendKey returns the immediately-preceding send key (for
-// tests). Returns ok=false if no Rekey has happened yet on this
-// direction.
-//
-// SECURITY NOTE: production code MUST NOT rely on this; it exists
-// solely so a regression test can assert that the new key differs
-// from the old one. The field is overwritten on each rotation so the
-// long-term retention surface is at most one obsolete key.
-func (s *SecureStream) PreviousSendKey() ([AEADKeyLen]byte, bool) {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	return s.prevSendKey, s.hasPrevSendKey
-}
-
-// CurrentSendKey returns the current send key. Test-only.
-func (s *SecureStream) CurrentSendKey() [AEADKeyLen]byte {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	return s.send.key
-}
+// Previous and current send keys are intentionally not retained or exposed.
 
 // deriveRekey computes the next-epoch (key, prefix) from the current
 // epoch using HKDF-Expand-only (no salt is required because key is
@@ -346,9 +446,26 @@ func deriveRekey(
 	prevPrefix [NoncePrefixLen]byte,
 	priorCounter uint64,
 ) ([AEADKeyLen]byte, [NoncePrefixLen]byte) {
+	return deriveRekeyWithLabel(prevKey, prevPrefix, priorCounter, rekeyLabel)
+}
+
+func (s *SecureStream) deriveRekey(
+	prevKey [AEADKeyLen]byte,
+	prevPrefix [NoncePrefixLen]byte,
+	priorCounter uint64,
+) ([AEADKeyLen]byte, [NoncePrefixLen]byte) {
+	return deriveRekeyWithLabel(prevKey, prevPrefix, priorCounter, suiteForVersion(s.version).rekeyLabel)
+}
+
+func deriveRekeyWithLabel(
+	prevKey [AEADKeyLen]byte,
+	prevPrefix [NoncePrefixLen]byte,
+	priorCounter uint64,
+	label string,
+) ([AEADKeyLen]byte, [NoncePrefixLen]byte) {
 	// Use HKDF-Expand directly: PRK = prevKey, info = label || counter.
-	info := make([]byte, 0, len(rekeyLabel)+8)
-	info = append(info, []byte(rekeyLabel)...)
+	info := make([]byte, 0, len(label)+8)
+	info = append(info, []byte(label)...)
 	for i := 7; i >= 0; i-- {
 		info = append(info, byte(priorCounter>>(uint(i)*8)))
 	}
@@ -384,20 +501,39 @@ type Event struct {
 // recv-direction AEAD is rotated to its next epoch and Recv loops to
 // read the next "real" frame. Application code therefore never
 // observes a rekey event.
-func (s *SecureStream) Recv() (*Event, error) {
+func (s *SecureStream) Recv() (event *Event, returnErr error) {
+	s.recvMu.Lock()
+	defer func() {
+		if returnErr != nil {
+			s.abortTransport()
+			s.wipeRecvLocked()
+		}
+		s.recvMu.Unlock()
+		if returnErr != nil {
+			s.writeMu.Lock()
+			s.wipeSendLocked()
+			s.writeMu.Unlock()
+		}
+	}()
 	for {
 		if s.closed.Load() {
-			return nil, io.ErrClosedPipe
+			returnErr = io.ErrClosedPipe
+			return nil, returnErr
 		}
 		wire, err := s.tr.ReadMessage()
 		if err != nil {
-			s.closeUnderlying()
-			return nil, err
+			returnErr = err
+			return nil, returnErr
 		}
-		df, err := DecodeFrame(bytes.NewReader(wire), s.recv)
+		reader := bytes.NewReader(wire)
+		df, err := s.decodeRecord(reader)
 		if err != nil {
-			s.closeUnderlying()
-			return nil, fmt.Errorf("ewp/v2: decode frame: %w", err)
+			returnErr = fmt.Errorf("ewp/v2: decode frame: %w", err)
+			return nil, returnErr
+		}
+		if reader.Len() != 0 {
+			returnErr = errors.New("ewp/v2: trailing bytes after frame")
+			return nil, returnErr
 		}
 		s.bytesIn.Add(uint64(len(wire)))
 		s.frmIn.Add(1)
@@ -416,21 +552,31 @@ func (s *SecureStream) Recv() (*Event, error) {
 			// pre-rekey counter). Anything else is a wire-format
 			// violation.
 			if len(df.Payload) != 8 {
-				s.closeUnderlying()
-				return nil, fmt.Errorf("ewp/v2: rekey payload len %d, want 8", len(df.Payload))
+				returnErr = fmt.Errorf("ewp/v2: rekey payload len %d, want 8", len(df.Payload))
+				return nil, returnErr
 			}
 			announced := binary.BigEndian.Uint64(df.Payload)
+			if announced == ^uint64(0) || announced+1 != s.recv.counter {
+				returnErr = ErrCounterMismatch
+				return nil, returnErr
+			}
 			oldKey := s.recv.key
 			oldPrefix := s.recv.prefix
-			newKey, newPrefix := deriveRekey(oldKey, oldPrefix, announced)
+			newKey, newPrefix := s.deriveRekey(oldKey, oldPrefix, announced)
 			newAEAD, err := NewFrameAEAD(newKey, newPrefix)
 			if err != nil {
-				s.closeUnderlying()
-				return nil, fmt.Errorf("ewp/v2: build rekeyed recv AEAD: %w", err)
+				returnErr = fmt.Errorf("ewp/v2: build rekeyed recv AEAD: %w", err)
+				return nil, returnErr
 			}
+			oldAEAD := s.recv
 			// Swap; subsequent frames decrypt under newAEAD with
 			// counter=0.
 			s.recv = newAEAD
+			oldAEAD.wipe()
+			zero(oldKey[:])
+			zero(oldPrefix[:])
+			zero(newKey[:])
+			zero(newPrefix[:])
 			continue // read the next real frame
 		}
 
@@ -439,16 +585,16 @@ func (s *SecureStream) Recv() (*Event, error) {
 		case FrameUDPNew, FrameUDPData, FrameUDPProbeResp:
 			gid, addr, hasAddr, err := parseUDPMeta(df.Meta)
 			if err != nil {
-				s.closeUnderlying()
-				return nil, fmt.Errorf("ewp/v2: parse UDP meta: %w", err)
+				returnErr = fmt.Errorf("ewp/v2: parse UDP meta: %w", err)
+				return nil, returnErr
 			}
 			ev.GlobalID = gid
 			ev.Address = addr
 			ev.HasAddr = hasAddr
 		case FrameUDPEnd, FrameUDPProbeReq:
-			if len(df.Meta) < 8 {
-				s.closeUnderlying()
-				return nil, errors.New("ewp/v2: UDP_END/PROBE_REQ meta too short")
+			if len(df.Meta) != 8 {
+				returnErr = errors.New("ewp/v2: UDP_END/PROBE_REQ meta length must be 8")
+				return nil, returnErr
 			}
 			copy(ev.GlobalID[:], df.Meta[:8])
 		case FrameTCPData, FramePing, FramePong, FramePaddingOnly,
@@ -456,8 +602,8 @@ func (s *SecureStream) Recv() (*Event, error) {
 			// no meta parsing required
 		default:
 			// FrameType.Valid() in DecodeFrame should already reject this.
-			s.closeUnderlying()
-			return nil, ErrFrameType
+			returnErr = ErrFrameType
+			return nil, returnErr
 		}
 		return ev, nil
 	}
@@ -470,16 +616,23 @@ func (s *SecureStream) Recv() (*Event, error) {
 // Close terminates the SecureStream and closes the underlying transport.
 // Idempotent.
 func (s *SecureStream) Close() error {
+	err := s.abortTransport()
+	s.writeMu.Lock()
+	s.wipeSendLocked()
+	s.writeMu.Unlock()
+	s.recvMu.Lock()
+	s.wipeRecvLocked()
+	s.recvMu.Unlock()
+	return err
+}
+
+func (s *SecureStream) abortTransport() error {
 	var err error
 	s.closeOnce.Do(func() {
 		s.closed.Store(true)
 		err = s.tr.Close()
 	})
 	return err
-}
-
-func (s *SecureStream) closeUnderlying() {
-	_ = s.Close()
 }
 
 // Stats returns lightweight observability counters.
@@ -523,9 +676,13 @@ func parseUDPMeta(meta []byte) (gid [8]byte, addr Address, hasAddr bool, err err
 	if len(meta) == 8 {
 		return
 	}
-	a, _, derr := DecodeAddress(meta[8:])
+	a, consumed, derr := DecodeAddress(meta[8:])
 	if derr != nil {
 		err = derr
+		return
+	}
+	if consumed != len(meta)-8 {
+		err = errors.New("ewp/v2: trailing bytes after UDP address")
 		return
 	}
 	addr = a

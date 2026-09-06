@@ -12,7 +12,7 @@
 //   M3 - sharded ReplayCache, no GC pause amplification
 //   M4 - tightened ±30s window with unified ErrReplay
 //   H4 - cheap rejection of unknown-PSK ClientHellos
-//   H5 - real FrameRekey with forward secrecy of session keys
+//   H5 - real FrameRekey with backward secrecy of prior session epochs
 //   L1 - PacketConn anti-replay (covered by frame counter discipline)
 
 package ewp
@@ -130,7 +130,7 @@ func TestFix_M3_ReplayCache_ConcurrentAdmits(t *testing.T) {
 // cache size strictly drops below the pre-sweep size when many entries
 // have expired. We bypass time.Now by using a tiny window.
 func TestFix_M3_ReplayCache_GCMonotonic(t *testing.T) {
-	cache := NewReplayCache(1 * time.Second)
+	cache := newReplayCache(1 * time.Second)
 	for i := 0; i < 8192; i++ {
 		var u [UUIDLen]byte
 		var n [HandshakeNonce]byte
@@ -222,7 +222,7 @@ func TestFix_M4_ReplayAndSkew_Indistinguishable(t *testing.T) {
 // ----------------------------------------------------------------------
 // H4: a flood of ClientHellos under PSKs the server does NOT know MUST
 // be rejected before any asymmetric crypto is touched. Strict signal:
-// median per-attack CPU time must be ≪ a single legitimate handshake.
+// average per-attack CPU time must be much lower than a legitimate handshake.
 // ----------------------------------------------------------------------
 
 func TestFix_H4_NoPSKAttackIsCheap(t *testing.T) {
@@ -233,52 +233,70 @@ func TestFix_H4_NoPSKAttackIsCheap(t *testing.T) {
 	good := fixesMustUUID(t)
 	lookup := MakeUUIDLookup([][UUIDLen]byte{good})
 
-	// Time a single legit accept.
-	legitMsg := fixesEncodeHello(t, good, uint32(time.Now().Unix()))
-	t0 := time.Now()
-	if _, _, err := AcceptClientHello(legitMsg, lookup); err != nil {
-		t.Fatalf("legit accept: %v", err)
-	}
-	legitDur := time.Since(t0)
-
 	// Pre-generate all evil messages OUT-of-loop so the timing only
-	// captures the server-side rejection cost, not the attacker's
-	// own keygen cost. (We also re-time the legit accept the same
-	// way for an apples-to-apples comparison.)
-	const N = 5000
-	evilMsgs := make([][]byte, N)
-	for i := 0; i < N; i++ {
+	// captures the server-side rejection cost, not the attacker's own keygen
+	// cost. Measure accepted handshakes in a batch too: a one-shot duration can
+	// be zero on clocks with coarse resolution.
+	const (
+		legitSamples = 128
+		evilSamples  = 5000
+		timingRounds = 4
+	)
+	evilMsgs := make([][]byte, evilSamples)
+	for i := 0; i < evilSamples; i++ {
 		evil := fixesMustUUID(t)
 		evilMsgs[i] = fixesEncodeHello(t, evil, uint32(time.Now().Unix()))
 	}
 
-	tStart := time.Now()
-	for i := 0; i < N; i++ {
-		_, _, err := AcceptClientHello(evilMsgs[i], lookup)
-		if err == nil {
-			t.Fatalf("evil hello %d unexpectedly accepted", i)
+	legitMsg := fixesEncodeHello(t, good, uint32(time.Now().Unix()))
+	legitStart := time.Now()
+	for round := 0; round < timingRounds; round++ {
+		for i := 0; i < legitSamples; i++ {
+			if _, _, err := AcceptClientHello(legitMsg, lookup); err != nil {
+				t.Fatalf("legit accept %d: %v", i, err)
+			}
 		}
-		if !errors.Is(err, ErrUnknownUUID) {
-			t.Fatalf("evil hello %d: expected ErrUnknownUUID, got %v", i, err)
+	}
+	totalLegit := time.Since(legitStart)
+	if totalLegit <= 0 {
+		t.Fatal("legitimate handshake benchmark has zero duration")
+	}
+
+	tStart := time.Now()
+	for round := 0; round < timingRounds; round++ {
+		for i := 0; i < evilSamples; i++ {
+			_, _, err := AcceptClientHello(evilMsgs[i], lookup)
+			if err == nil {
+				t.Fatalf("evil hello %d unexpectedly accepted", i)
+			}
+			if !errors.Is(err, ErrUnknownUUID) {
+				t.Fatalf("evil hello %d: expected ErrUnknownUUID, got %v", i, err)
+			}
 		}
 	}
 	totalEvil := time.Since(tStart)
-	avgEvil := totalEvil / N
+	if totalEvil <= 0 {
+		t.Fatal("unknown-UUID rejection benchmark has zero duration")
+	}
+	legitCalls := legitSamples * timingRounds
+	evilCalls := evilSamples * timingRounds
 
 	// Strict assertion: the average evil rejection MUST be under 10%
 	// of one legit handshake. This catches any accidental ECDH /
-	// ML-KEM call on the rejection path.
-	if avgEvil > legitDur/10 {
-		t.Fatalf("avg evil reject %v >= 10%% of legit %v — server is doing crypto on bad PSK",
-			avgEvil, legitDur)
+	// ML-KEM call on the rejection path. Compare aggregate durations to avoid
+	// truncating a fast rejection average to zero on coarse clocks.
+	if totalEvil*10*time.Duration(legitCalls) >= totalLegit*time.Duration(evilCalls) {
+		t.Fatalf("evil rejects total %v are >= 10%% of legit total %v per call; server is doing crypto on bad PSK",
+			totalEvil, totalLegit)
 	}
-	t.Logf("legit=%v   avg-evil-reject=%v   ratio=%.2f%%",
-		legitDur, avgEvil, float64(avgEvil)/float64(legitDur)*100)
+	t.Logf("legit-total=%v/%d evil-total=%v/%d ratio=%.2f%%",
+		totalLegit, legitCalls, totalEvil, evilCalls,
+		float64(totalEvil)*float64(legitCalls)/float64(totalLegit)/float64(evilCalls)*100)
 }
 
 // ----------------------------------------------------------------------
 // H5: FrameRekey MUST actually rotate the per-direction keys and offer
-// forward secrecy: after rekey, the old AEAD MUST refuse to decrypt
+// backward secrecy for prior epochs: after rekey, the old AEAD MUST refuse to decrypt
 // any new traffic, and an attacker that captured pre-rekey ciphertexts
 // gains nothing from the new key.
 // ----------------------------------------------------------------------
@@ -381,14 +399,14 @@ func TestFix_H5_RekeyRotatesKeysAndProvidesForwardSecrecy(t *testing.T) {
 		t.Fatal("client send AEAD pointer did not rotate after Rekey")
 	}
 
-	// Strict: forward secrecy. We zero a copy of the *old* C2S key and
+	// Strict: backward secrecy. We zero a copy of the *old* C2S key and
 	// confirm that constructing an AEAD over that key cannot decrypt
 	// the post-rekey ciphertext. The post-fix API SHOULD expose
 	// CurrentSendKey() (or equivalent) so the test can attest that the
 	// new key is not equal to the old one.
 	if oldKey, newKey, ok := rekeyKeyMaterialEqual(cli); ok {
 		if oldKey == newKey {
-			t.Fatal("post-rekey key equals pre-rekey key (no forward secrecy)")
+			t.Fatal("post-rekey key equals pre-rekey key (no key evolution)")
 		}
 	}
 }

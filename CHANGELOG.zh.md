@@ -5,6 +5,43 @@
 
 ---
 
+## 未发布 - EWP/v2.2 不透明记录
+
+- 新增 `ClientV22`、`ServiceV22`、显式 v2.2 握手入口和仅适用于 v2.2 的
+  SecureStream 构造器。v2.1 与 v2.2 的认证标签故意互相拒绝，且不存在回退。
+- 新增 v2.2 记录格式：线外仅保留 bucketized 且已认证的密文长度。计数器、类型、
+  metadata 长度、payload 长度和随机填充都在记录内部加密并认证。
+- 新增独立的 v2.2 外层握手、会话、方向和 rekey 标签。
+- 直接调用 `EncodeFrameV22` 默认也会 bucketize；高层 stream 对应用、rekey 和
+  cover 记录统一进行与阶段相关的 bucket 规划。
+- 新增低层 malformed record、KDF 域隔离、rekey、尾随字节、TCP、UDP 和
+  V21/V22 不分发回归测试。
+- 新增 `EWP_V22.md`，定义协调切换和无回退约束。
+
+## 未发布 - 安全加固后续工作
+
+本节记录对冻结审计基线
+`SECURITY_AUDIT_BASELINE_AND_REMEDIATION_PLAN.md` 的后续修复，不代表已获得
+严格安全部署批准。
+
+- UUID-only 的 `Client`、`Service`、`NewClient`、`NewService`、
+  `WriteClientHello` 与旧 accept API 已标记为废弃。后续新部署应使用带服务端
+  静态公钥绑定的 v2.2 构造器。
+- 新增默认握手超时与取消路径，取消时会关闭阻塞的消息传输。
+- `ReplayCache` 增加公开最小重放窗口、单调时钟过期、完整 key 分片和
+  fail-closed 全局容量上限。
+- 拒绝帧计数器耗尽、帧或 UDP metadata 尾随字节和模式不匹配的 TCP/UDP 帧，
+  并在关闭和传输失败时清除帧 AEAD 引用。
+- 并发 UDP 首次写入已原子化；traffic shaper 的 flush 已串行化，慢传输不能
+  让后续应用数据越过先前 flush。
+- StreamShaper 现在会记录异步 flush 和 cover send 失败并拒绝后续写入；关闭时
+  先进行有界 graceful flush，再中断阻塞对端。
+- 高层 v2.1 TCP 路径已安装 shaper；可观察的填充和时序选择使用 `crypto/rand`。
+- `Rekey` 是单向密钥演进：它为先前 epoch 提供后向保密，不提供失陷后恢复。
+- 仍有重要限制：v2.1 帧线格式会暴露精确 payload 长度，ClientHello 重放状态仅在
+  进程内，v2.2 在 UUID 鉴权前仍要做静态 ECDH/候选工作，且静态私钥与 UUID
+  同时泄露后历史 ClientHello metadata 不具备前向保密。
+
 ## v0.1.2 — 加固版本
 
 本次发布在不改动密码学核心的前提下,针对三类真实威胁(基于重放的 DoS、

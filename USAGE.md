@@ -2,10 +2,16 @@
 
 This document shows how to embed `github.com/justinwoo280/sing-ewp` into a
 proxy framework (sing-box, mihomo, custom Go binary). The library is
-deliberately small and unopinionated: it implements the EWP v2 wire
+deliberately small and unopinionated: it implements the EWP/v2.2 wire
 protocol and gives you `net.Conn` / `net.PacketConn` adapters; it does
 not decide what transport you run it over (TLS, WebSocket, gRPC, h3,
-plain TCP — all work).
+plain TCP - all work).
+
+All deployment examples use `ClientV22` and `ServiceV22`. Pin the server
+static public key out of band; do not use the deprecated UUID-only APIs for a
+new deployment. EWP/v2.2 bucketizes the observable data-plane record length,
+but does not provide deployment-wide replay protection or ClientHello metadata
+forward secrecy.
 
 ## Quick mental model
 
@@ -13,7 +19,7 @@ plain TCP — all work).
 +--------------------------+
 |  application bytes       |
 +--------------------------+
-|  ewp.Client / ewp.Service  ← this library
+|  ewp.ClientV22 / ewp.ServiceV22  <- this library
 +--------------------------+
 |  TLS (with optional ECH)   ← your TLS layer
 +--------------------------+
@@ -24,9 +30,18 @@ plain TCP — all work).
 +--------------------------+
 ```
 
-`ewp.Client.DialConn` accepts a `net.Conn` (the byte stream after TLS
+`ewp.ClientV22.DialConn` accepts a `net.Conn` (the byte stream after TLS
 + transport) and returns a `net.Conn` whose Read/Write transparently
 encrypt under EWP's per-direction AEAD.
+
+### EWP and TLS terminology
+
+`EWP ClientHello` is the EWP protocol message sent after the optional outer
+TLS transport has been established. It is not the `TLS ClientHello` sent by a
+TLS implementation. The same distinction applies to `EWP ServerHello` and
+`TLS ServerHello`. The EWP cookie, prekey, replay, Finished, and metadata
+controls apply to EWP messages; TLS is an additional transport layer and is
+not required for the EWP handshake itself.
 
 ## Minimal client
 
@@ -39,7 +54,7 @@ import (
     "github.com/justinwoo280/sing-ewp"
 )
 
-func dialEWP(ctx context.Context, server, uuid string, dst ewp.Address) (net.Conn, error) {
+func dialEWP(ctx context.Context, server, uuid, serverStaticPubB64 string, dst ewp.Address) (net.Conn, error) {
     raw, err := (&net.Dialer{}).DialContext(ctx, "tcp", server)
     if err != nil { return nil, err }
     tlsConn := tls.Client(raw, &tls.Config{ServerName: "your.server.com"})
@@ -47,7 +62,7 @@ func dialEWP(ctx context.Context, server, uuid string, dst ewp.Address) (net.Con
         raw.Close()
         return nil, err
     }
-    client, err := ewp.NewClient(uuid)
+    client, err := ewp.NewClientV22(uuid, serverStaticPubB64)
     if err != nil { tlsConn.Close(); return nil, err }
     return client.DialConn(ctx, tlsConn, dst)
 }
@@ -73,7 +88,9 @@ func (h *myHandler) NewPacketConnection(ctx context.Context, pc net.PacketConn, 
     return nil
 }
 
-svc := ewp.NewService(&myHandler{})
+svc, err := ewp.NewServiceV22(&myHandler{}, serverStaticPrivB64)
+if err != nil { return err }
+defer svc.Close()
 svc.AddUser("11111111-2222-3333-4444-555555555555")
 
 ln, _ := tls.Listen("tcp", ":443", tlsConfig)
@@ -99,6 +116,7 @@ type EWPOutboundOptions struct {
     DialerOptions
     ServerOptions
     UUID    string      `json:"uuid"`
+    ServerStaticPublicKey string `json:"server_static_public_key"`
     Network NetworkList `json:"network,omitempty"`
     OutboundTLSOptionsContainer
     Multiplex *OutboundMultiplexOptions `json:"multiplex,omitempty"`
@@ -108,6 +126,7 @@ type EWPOutboundOptions struct {
 type EWPInboundOptions struct {
     ListenOptions
     Users []EWPUser `json:"users,omitempty"`
+    ServerStaticPrivateKey string `json:"server_static_private_key"`
     InboundTLSOptionsContainer
     Multiplex *InboundMultiplexOptions `json:"multiplex,omitempty"`
     Transport *V2RayTransportOptions   `json:"transport,omitempty"`
@@ -155,7 +174,7 @@ type Outbound struct {
     serverAddr M.Socksaddr
     tlsConfig  tls.Config
     transport  adapter.V2RayClientTransport
-    client     *sewp.Client
+    client     *sewp.ClientV22
     logger     log.ContextLogger
 }
 
@@ -180,7 +199,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
             common.PtrValueOrDefault(options.Transport), o.tlsConfig)
         if err != nil { return nil, err }
     }
-    o.client, err = sewp.NewClient(options.UUID)
+    o.client, err = sewp.NewClientV22(options.UUID, options.ServerStaticPublicKey)
     if err != nil { return nil, err }
     return o, nil
 }
@@ -223,7 +242,7 @@ type Inbound struct {
     listener  *listener.Listener
     tlsConfig tls.ServerConfig
     transport adapter.V2RayServerTransport
-    service   *sewp.Service
+    service   *sewp.ServiceV22
     router    adapter.ConnectionRouterEx
     logger    log.ContextLogger
 }
@@ -277,8 +296,9 @@ func (h *handler) NewPacketConnection(ctx context.Context, pc net.PacketConn, md
     "type": "ewp",
     "tag": "ewp-out",
     "server": "your.server.com",
-    "server_port": 443,
-    "uuid": "11111111-2222-3333-4444-555555555555",
+     "server_port": 443,
+     "uuid": "11111111-2222-3333-4444-555555555555",
+     "server_static_public_key": "base64-encoded-32-byte-x25519-public-key",
     "tls": {
       "enabled": true,
       "server_name": "your.server.com",
@@ -297,13 +317,12 @@ func (h *handler) NewPacketConnection(ctx context.Context, pc net.PacketConn, md
 
 ## Threading and lifecycle
 
-- `*Client` is safe to share across goroutines; each Dial owns its own
+- `*ClientV22` is safe to share across goroutines; each Dial owns its own
   underlying conn.
-- `*Service` is safe to call `HandleConn` on from many goroutines.
-- The `net.Conn` returned by `Client.DialConn` allows concurrent
-  `Write`, but `Read` MUST come from a single goroutine (this matches
-  the underlying SecureStream contract: the receive AEAD counter would
-  race otherwise).
+- `*ServiceV22` is safe to call `HandleConn` on from many goroutines.
+- The `net.Conn` returned by `ClientV22.DialConn` allows concurrent
+  `Write`. `SecureStream.Recv` serializes concurrent readers, though a
+  single reader is still recommended for predictable event ordering.
 - Closing the returned `net.Conn` / `net.PacketConn` is idempotent and
   safely closes the underlying transport.
 
@@ -311,36 +330,34 @@ func (h *handler) NewPacketConnection(ctx context.Context, pc net.PacketConn, md
 
 EWP v2 is a message-oriented protocol; the on-wire framing of
 individual messages is the responsibility of the transport layer.
-This library provides `LengthFramer`, a 4-byte big-endian length
+This library provides `LengthFramer`, a 3-byte big-endian length
 prefix wrapper that turns any `net.Conn` into a `MessageTransport`,
-and `Client.DialConn` / `Service.HandleConn` apply it automatically.
+and `ClientV22.DialConn` / `ServiceV22.HandleConn` apply it automatically.
 
 If you carry EWP over a transport that already preserves message
 boundaries (WebSocket, gRPC streams, HTTP/3 datagrams), you can
 implement `MessageTransport` directly and use
-`Service.HandleMessageTransport` to skip the redundant length prefix.
+`ServiceV22.HandleMessageTransport` to skip the redundant length prefix.
 
 ## Crypto invariants this library enforces
 
 (See the `README.md` for full spec context.)
 
-- Hybrid X25519 + ML-KEM-768 handshake, per session.
-- Distinct C2S and S2C ChaCha20-Poly1305 keys derived via HKDF-SHA256
-  with 4 separate `info` labels (`EWPv2 c2s key`, `EWPv2 s2c key`,
-  `EWPv2 c2s nonce-prefix`, `EWPv2 s2c nonce-prefix`) — prevents
-  reflection attacks.
-- 64-bit per-direction frame counter wrapped into AEAD nonce —
-  prevents replay and reorder.
-- Outer MAC over ClientHello and ServerHello using the UUID PSK with
-  constant-time comparison — prevents timing oracles on UUID.
-- Ephemeral private keys (`x25519Priv`, `mlkemPriv`) are zeroed and
-  set to `nil` immediately after deriving session keys — bounds the
-  window in which a Heartbleed-style memory disclosure could leak
-  long-term-equivalent secrets.
+- v2.2 binds the outer handshake to a pinned server X25519 public key and
+  uses ephemeral X25519 plus ML-KEM-768 for post-handshake data keys.
+- Distinct C2S and S2C ChaCha20-Poly1305 keys and nonce prefixes prevent
+  direction reflection; frame counters reject replay, reordering, and wrap.
+- Observable padding and timing decisions use `crypto/rand`; v2.2 encrypts
+  the frame counter, type, metadata length, payload length, and padding.
+- Ephemeral byte slices and frame AEAD references are cleared on normal
+  teardown and error paths on a best-effort basis. Go does not provide
+  guaranteed secure memory erasure for opaque runtime-managed key objects.
+- The v2.2 outer record reveals only a bucketized ciphertext length. v2.1
+  remains length-leaking for migration only, and `Rekey` remains one-way key
+  evolution rather than post-compromise recovery.
 
 ## Versioning
 
-`v0.x.x` is pre-1.0: the wire format is stable (matches the EWP v2
-spec), but the Go API may evolve in minor revisions as we wire it
-into sing-box and discover unergonomic edges. Pin a tag in `go.mod`
-and read the CHANGELOG before bumping.
+`v0.x.x` is pre-1.0: wire revisions are explicitly incompatible and may
+continue to evolve with the security model. Pin a tag in `go.mod`, coordinate
+peer upgrades, and read `UPGRADING.md` plus the changelog before bumping.

@@ -1,5 +1,44 @@
 # Upgrading sing-ewp
 
+> **Terminology.** In this document, an unqualified `ClientHello` or
+> `ServerHello` means the EWP protocol message. A `TLS ClientHello` or `TLS
+> ServerHello` is explicitly labeled as such and belongs to the optional outer
+> transport layer.
+
+## EWP/v2.1 -> EWP/v2.2
+
+> **Data-plane wire break.** v2.2 encrypts the frame counter, type, metadata
+> length, payload length, and padding inside a bucketized AEAD record. v2.1
+> and v2.2 use different outer-handshake, session, and rekey labels, so they
+> reject each other before any application handler is invoked. There is no
+> negotiation or automatic fallback.
+
+### What changed
+
+| Area | v2.1 | v2.2 |
+|---|---|---|
+| Visible record fields | Frame length, counter, type, metadata length, padding length | Bucketized ciphertext length only |
+| Inner record | `AEAD(metadata || payload)` | `AEAD(counter || type || metadata length || payload length || metadata || payload || random padding)` |
+| Session labels | v2.1 / legacy-compatible labels | `ewp/v2.2 ...` labels only |
+| High-level API | `NewClientV21` / `NewServiceV21` | `NewClientV22` / `NewServiceV22` |
+
+### Migration
+
+1. Upgrade clients to `NewClientV22(uuid, serverStaticPubB64)`.
+2. Upgrade servers to `NewServiceV22(handler, serverStaticPrivB64)`.
+3. Coordinate the cutover or use separate endpoints for v2.1 and v2.2.
+   A single endpoint must not retry an alternate revision after a failed
+   handshake.
+4. Keep the same out-of-band pinned static public key provisioning model.
+5. Re-run packet-size and traffic-shaping capacity tests for your transport;
+   `MaxV22RecordSize` limits the complete EWP record to 64 KiB.
+
+See `EWP_V22.md` for the normative record layout and
+`SECURITY_AUDIT_BASELINE_AND_REMEDIATION_PLAN.md` for remaining security
+limitations. v2.2 mitigates exact data-plane length exposure, but it does not
+by itself add a Finished exchange, shared replay store, ClientHello metadata
+forward secrecy, or pre-authentication DoS protection.
+
 ## v0.1.x → v0.2.0  (EWP/v2 → EWP/v2.1)
 
 > ⚠️ **Cryptographic break.** v0.2.0 derives every handshake key
@@ -22,11 +61,13 @@ the user UUID (= PSK). This made two practical attacks possible:
   a handshake from the server side; there was no notion of "server
   identity" to bind against.
 
-v0.2.0 fixes both by mixing a long-term server X25519 static-ECDH
-share into the handshake KDF chain. An attacker without the server's
-static private key can neither decrypt a captured `ClientHello` nor
-impersonate the server. See `CHANGELOG.md` for the full list of 12
-findings closed.
+v0.2.0 requires a pinned long-term server X25519 public key. A UUID holder
+without the matching static private key cannot impersonate the server or
+decrypt a captured `ClientHello`. This does not provide ClientHello metadata
+forward secrecy against a later compromise of both the static private key and
+the UUID. It also does not provide deployment-wide replay protection or hide
+exact frame payload lengths. See `SECURITY_AUDIT_BASELINE_AND_REMEDIATION_PLAN.md`
+for the remaining deployment constraints.
 
 ### What changed on the wire
 
@@ -49,27 +90,12 @@ parseable by a v0.2.0 server, but the outer MAC fails closed.
 1. **Generate a server static keypair (once per deployment).**
 
    ```go
-   privB64, pubB64, err := ewp.GenerateServerStaticKeypair()
-   // privB64 → server config (file mode 0600)
-   // pubB64  → distributed to every authorised client
+    privB64, pubB64, err := ewp.GenerateServerStaticKeypair()
+    // Persist privB64 directly in a protected server-side secret store.
+    // Distribute pubB64 to every authorised client.
    ```
 
-   You can also generate offline:
-
-   ```bash
-   go run -tags none . <<'EOF'
-   package main
-   import (
-       "fmt"
-       "github.com/justinwoo280/sing-ewp"
-   )
-   func main() {
-       priv, pub, _ := ewp.GenerateServerStaticKeypair()
-       fmt.Println("priv =", priv)
-       fmt.Println("pub  =", pub)
-   }
-   EOF
-   ```
+    Do not print the private key to a terminal, CI log, or shell history.
 
 2. **Switch every server constructor to `NewServiceV21`.**
 
@@ -94,10 +120,10 @@ parseable by a v0.2.0 server, but the outer MAC fails closed.
    MAC verification failed`). The wire bytes do flow once, but no
    data is exchanged.
 
-6. **No persistent state needs to be migrated.** Replay caches,
-   session keys, and per-stream counters all live for the lifetime of
-   a single connection; restarting the process discards them. There
-   is no on-disk format to upgrade.
+6. **Plan replay state deliberately.** The bundled replay cache is
+   process-local. Restarting a service or sending the same ClientHello to a
+   second instance loses its replay history, so deployments with side-effecting
+   handlers need coordinated replay protection outside this package.
 
 7. **Tighten your timestamp budget.** `HandshakeTimestampWindow`
    dropped from 120 s to 30 s. Make sure NTP is running on every host
@@ -105,8 +131,11 @@ parseable by a v0.2.0 server, but the outer MAC fails closed.
 
 ### What you get
 
-- **Server identity binding.** A leaked UUID no longer compromises
-  past traffic and cannot impersonate the server going forward.
+- **Server identity binding.** A leaked UUID alone cannot impersonate the
+  server to a client that pins the genuine static public key.
+- **Data-frame forward secrecy.** The post-handshake data keys use fresh
+  ephemeral X25519 and ML-KEM-768 material. This does not extend to recorded
+  ClientHello metadata after a static-key compromise.
 - **Truncation-resistant outer MAC.** Any byte-length mutation of the
   inner ciphertext is detected.
 - **Unlinkable `SessionID`.** Two handshakes from the same user yield
@@ -116,9 +145,9 @@ parseable by a v0.2.0 server, but the outer MAC fails closed.
 - **Fewer DPI fingerprints.** The 3-byte length prefix removes the
   always-zero high bytes; the v2.1 KDF salt eliminates correlated
   bits in derived keys.
-- **`Rekey()` actually rotates keys.** Long-lived sessions can ask
-  for forward secrecy of session keys; the receiver rotates
-  transparently.
+- **`Rekey()` evolves keys.** Long-lived sessions can rotate a direction's
+  key one-way; this gives backward secrecy for prior epochs but not
+  post-compromise recovery.
 
 ### What can go wrong (and how to spot it)
 
@@ -178,7 +207,7 @@ list of changes and the security rationale.
 
 ### Optional: keep replay protection enabled (it is, by default)
 
-`NewService` now installs a `ReplayCache(ReplayWindow)` automatically.
+`NewServiceV21` installs a `ReplayCache(ReplayWindow)` automatically.
 You only need to call `SetReplayCache` if you want to:
 
 - Disable it (e.g. in benchmarks where you replay a captured
@@ -186,12 +215,13 @@ You only need to call `SetReplayCache` if you want to:
 - Install a cache with a different window or your own GC strategy.
 
 ```go
-svc := ewp.NewService(handler)
-// Default: anti-replay on, window = 180s.
+svc, err := ewp.NewServiceV21(handler, serverStaticPrivB64)
+if err != nil { return err }
+// Default: anti-replay on, window = 60s.
 
 // Override for a high-RTT link with permissive ts-window:
 svc.SetReplayCache(ewp.NewReplayCache(5 * time.Minute))
 
-// Disable for tests only:
+// Disable only in narrowly scoped tests:
 svc.SetReplayCache(nil)
 ```

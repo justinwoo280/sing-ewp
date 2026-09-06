@@ -18,17 +18,17 @@ var (
 	// every byte is authenticated by the outer MAC instead. This
 	// sentinel is preserved only so external code that referenced it
 	// continues to compile.
-	ErrMagic            = errors.New("ewp/v2: bad magic")
-	ErrHandshakeShort   = errors.New("ewp/v2: handshake message too short")
-	ErrHandshakeLong    = errors.New("ewp/v2: handshake ciphertext exceeds bound")
-	ErrOuterMAC         = errors.New("ewp/v2: outer MAC verification failed")
-	ErrAEADHandshake    = errors.New("ewp/v2: handshake AEAD open failed")
-	ErrTimestamp        = errors.New("ewp/v2: handshake timestamp out of window")
-	ErrUUIDMismatch     = errors.New("ewp/v2: inner UUID does not match outer")
-	ErrCommand          = errors.New("ewp/v2: unsupported command")
-	ErrServerStatus     = errors.New("ewp/v2: server returned non-OK status")
-	ErrUnknownUUID      = errors.New("ewp/v2: unknown UUID")
-	ErrPlaintextLayout  = errors.New("ewp/v2: handshake plaintext malformed")
+	ErrMagic           = errors.New("ewp/v2: bad magic")
+	ErrHandshakeShort  = errors.New("ewp/v2: handshake message too short")
+	ErrHandshakeLong   = errors.New("ewp/v2: handshake ciphertext exceeds bound")
+	ErrOuterMAC        = errors.New("ewp/v2: outer MAC verification failed")
+	ErrAEADHandshake   = errors.New("ewp/v2: handshake AEAD open failed")
+	ErrTimestamp       = errors.New("ewp/v2: handshake timestamp out of window")
+	ErrUUIDMismatch    = errors.New("ewp/v2: inner UUID does not match outer")
+	ErrCommand         = errors.New("ewp/v2: unsupported command")
+	ErrServerStatus    = errors.New("ewp/v2: server returned non-OK status")
+	ErrUnknownUUID     = errors.New("ewp/v2: unknown UUID")
+	ErrPlaintextLayout = errors.New("ewp/v2: handshake plaintext malformed")
 )
 
 // Command is the operation requested by the client in the handshake.
@@ -68,19 +68,20 @@ type ServerHello struct {
 // HandshakeResult bundles the materials a SecureStream needs after a
 // successful handshake on either side.
 type HandshakeResult struct {
-	Keys           SessionKeys
-	ClientHello    *ClientHello // populated on the server side
-	ServerHello    *ServerHello // populated on the client side
+	Keys        SessionKeys
+	ClientHello *ClientHello // populated on the server side
+	ServerHello *ServerHello // populated on the client side
 }
 
 // ClientHandshakeState holds ephemeral material the client needs
 // between WriteClientHello and ReadServerHello.
 type ClientHandshakeState struct {
-	uuid         [UUIDLen]byte
-	nonce        [HandshakeNonce]byte
-	x25519Priv   *ecdh.PrivateKey
-	mlkemPriv    *mlkem.DecapsulationKey768
-	hello        *ClientHello
+	uuid       [UUIDLen]byte
+	nonce      [HandshakeNonce]byte
+	x25519Priv *ecdh.PrivateKey
+	mlkemPriv  *mlkem.DecapsulationKey768
+	hello      *ClientHello
+	version    protocolVersion
 }
 
 // ----------------------------------------------------------------------
@@ -93,6 +94,9 @@ type ClientHandshakeState struct {
 //
 // The caller supplies the UUID (PSK), the desired Command, and the
 // destination Address.
+//
+// Deprecated: Use WriteClientHelloV21. This legacy UUID-only handshake does
+// not authenticate the server.
 func WriteClientHello(
 	send func([]byte) error,
 	uuid [UUIDLen]byte,
@@ -230,6 +234,9 @@ type UUIDLookup func(msg []byte, mac [OuterMACLen]byte) ([UUIDLen]byte, error)
 // before. Production servers SHOULD use AcceptClientHelloWithReplay
 // (which Service does internally) to harden against replay-induced
 // CPU exhaustion and traffic-correlation probes.
+//
+// Deprecated: Use AcceptClientHelloV21WithReplay. This legacy UUID-only
+// handshake does not authenticate the server.
 func AcceptClientHello(
 	msg []byte,
 	lookup UUIDLookup,
@@ -245,6 +252,9 @@ func AcceptClientHello(
 //
 // Passing cache == nil makes this function equivalent to
 // AcceptClientHello (replay detection disabled).
+//
+// Deprecated: Use AcceptClientHelloV21WithReplay. This legacy UUID-only
+// handshake does not authenticate the server.
 func AcceptClientHelloWithReplay(
 	msg []byte,
 	lookup UUIDLookup,

@@ -3,25 +3,25 @@ package ewp
 // EWP/v2.1 high-level Client and Service.
 //
 // These are drop-in upgrades of NewClient / NewService that bind the
-// handshake KDF to a long-term server X25519 identity, closing audit
-// findings S1, S2, and H2.
+// handshake KDF to a long-term server X25519 identity. They prevent a
+// UUID holder alone from impersonating the server to a client that pins
+// the genuine public key.
 //
-// New callers SHOULD use NewClientV21 / NewServiceV21. The original
-// NewClient / NewService remain in place but are now considered
-// deprecated; they speak the v2.0 wire which the v2.1 server will
-// REJECT, so a mismatched pair fails closed.
+// New callers SHOULD use NewClientV22 / NewServiceV22. The original
+// NewClient / NewService remain in place but are now considered deprecated;
+// they speak the v2.0 wire which v2.1 and v2.2 servers reject. v2.1 remains
+// available only for migration and exposes a clear data-plane frame header;
+// see SECURITY_AUDIT_BASELINE_AND_REMEDIATION_PLAN.md.
 
 import (
 	"context"
 	"crypto/ecdh"
 	crand "crypto/rand"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"io"
 	"net"
 	"sync"
-	"time"
 )
 
 // ----------------------------------------------------------------------
@@ -35,9 +35,12 @@ import (
 // One ClientV21 = one configured (UUID, server identity) pair. It is
 // safe to share across goroutines; each Dial call performs an
 // independent handshake on its own underlying connection.
+//
+// Deprecated: Use ClientV22 for opaque, bucketized data-plane records.
 type ClientV21 struct {
 	uuid            [UUIDLen]byte
 	serverStaticPub [X25519PubLen]byte
+	version         protocolVersion
 }
 
 // NewClientV21 parses a UUID string and a base64-encoded 32-byte
@@ -45,17 +48,23 @@ type ClientV21 struct {
 // returns a ready ClientV21.
 //
 // serverStaticPubB64 is REQUIRED; passing the empty string is an
-// error. Operators that wish to opt out of server identity binding
-// should use the legacy NewClient (which speaks v2.0 and is vulnerable
-// to S1 / S2 / H2).
+// error. New deployments should use NewClientV22, whose opaque records hide
+// frame type and exact payload length from the wire.
+//
+// Deprecated: Use NewClientV22.
 func NewClientV21(uuidStr, serverStaticPubB64 string) (*ClientV21, error) {
+	return newClientV2x(uuidStr, serverStaticPubB64, protocolVersionV21)
+}
+
+func newClientV2x(uuidStr, serverStaticPubB64 string, version protocolVersion) (*ClientV21, error) {
+	protocolName := suiteForVersion(version).name
 	u, err := ParseUUID(uuidStr)
 	if err != nil {
 		return nil, err
 	}
 	pub, err := base64.StdEncoding.DecodeString(serverStaticPubB64)
 	if err != nil {
-		return nil, fmt.Errorf("ewp/v2.1: server_static_pub: %w", err)
+		return nil, fmt.Errorf("%s: server_static_pub: %w", protocolName, err)
 	}
 	if len(pub) != X25519PubLen {
 		return nil, fmt.Errorf("%w: want %d bytes, got %d", ErrStaticPub, X25519PubLen, len(pub))
@@ -63,7 +72,7 @@ func NewClientV21(uuidStr, serverStaticPubB64 string) (*ClientV21, error) {
 	if _, err := ecdh.X25519().NewPublicKey(pub); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrStaticPub, err)
 	}
-	c := &ClientV21{uuid: u}
+	c := &ClientV21{uuid: u, version: version}
 	copy(c.serverStaticPub[:], pub)
 	return c, nil
 }
@@ -79,10 +88,12 @@ func (c *ClientV21) DialConn(ctx context.Context, conn net.Conn, dst Address) (n
 	if err != nil {
 		return nil, err
 	}
-	return &streamConn{
+	sc := &streamConn{
 		SecureStream: stream,
 		underlying:   conn,
-	}, nil
+	}
+	sc.shaper = NewStreamShaper(stream, DefaultShaperConfig())
+	return sc, nil
 }
 
 // DialPacketConn is the v2.1 counterpart of Client.DialPacketConn.
@@ -98,32 +109,36 @@ func (c *ClientV21) DialPacketConn(ctx context.Context, conn net.Conn, dst Addre
 func (c *ClientV21) handshake(
 	ctx context.Context, tr MessageTransport, cmd Command, dst Address,
 ) (*SecureStream, error) {
-	if dl, ok := ctx.Deadline(); ok {
-		if dc, ok := tr.(deadlineSetter); ok {
-			_ = dc.SetDeadline(dl)
-			defer func() { _ = dc.SetDeadline(time.Time{}) }()
-		}
-	}
+	hctx, finish := beginHandshake(ctx, tr)
+	defer finish()
+	suite := suiteForVersion(c.version)
 
-	state, err := WriteClientHelloV21(tr.SendMessage, c.uuid, cmd, dst, c.serverStaticPub[:])
+	state, err := writeClientHelloV2x(func(msg []byte) error {
+		return sendMessageContext(hctx, tr, msg)
+	}, c.uuid, cmd, dst, c.serverStaticPub[:], suite)
 	if err != nil {
 		_ = tr.Close()
-		return nil, fmt.Errorf("ewp/v2.1: write ClientHello: %w", err)
+		return nil, fmt.Errorf("%s: write ClientHello: %w", suite.name, err)
 	}
-	shBytes, err := tr.ReadMessage()
+	shBytes, err := readMessageContext(hctx, tr)
 	if err != nil {
 		_ = tr.Close()
-		return nil, fmt.Errorf("ewp/v2.1: read ServerHello: %w", err)
+		return nil, fmt.Errorf("%s: read ServerHello: %w", suite.name, err)
 	}
-	res, err := state.ReadServerHelloV21(shBytes, c.serverStaticPub[:])
+	res, err := state.readServerHelloV2x(shBytes, c.serverStaticPub[:], suite)
 	if err != nil {
 		_ = tr.Close()
-		return nil, fmt.Errorf("ewp/v2.1: process ServerHello: %w", err)
+		return nil, fmt.Errorf("%s: process ServerHello: %w", suite.name, err)
 	}
-	stream, err := NewClientSecureStream(tr, res.Keys)
+	var stream *SecureStream
+	if c.version == protocolVersionV22 {
+		stream, err = NewClientSecureStreamV22(tr, res.Keys)
+	} else {
+		stream, err = NewClientSecureStream(tr, res.Keys)
+	}
 	if err != nil {
 		_ = tr.Close()
-		return nil, fmt.Errorf("ewp/v2.1: build SecureStream: %w", err)
+		return nil, fmt.Errorf("%s: build SecureStream: %w", suite.name, err)
 	}
 	return stream, nil
 }
@@ -139,9 +154,12 @@ func (c *ClientV21) handshake(
 // genuine server from a PSK-holding impersonator. It is the operator's
 // responsibility to protect it (file mode 0600, KMS, etc.); rotating
 // it requires re-issuing every client's serverStaticPub configuration.
+//
+// Deprecated: Use ServiceV22 for opaque, bucketized data-plane records.
 type ServiceV21 struct {
 	handler    Handler
 	staticPriv *ecdh.PrivateKey
+	version    protocolVersion
 
 	usersMu sync.RWMutex
 	users   [][UUIDLen]byte
@@ -155,13 +173,20 @@ type ServiceV21 struct {
 // v2.1 KDF chain. staticPrivB64 is the base64-encoded 32-byte X25519
 // scalar; the matching public key MUST be distributed to every
 // authorised client (see ClientV21.serverStaticPub).
+//
+// Deprecated: Use NewServiceV22.
 func NewServiceV21(h Handler, staticPrivB64 string) (*ServiceV21, error) {
+	return newServiceV2x(h, staticPrivB64, protocolVersionV21)
+}
+
+func newServiceV2x(h Handler, staticPrivB64 string, version protocolVersion) (*ServiceV21, error) {
+	protocolName := suiteForVersion(version).name
 	if h == nil {
-		return nil, errors.New("ewp/v2.1: NewServiceV21: handler is nil")
+		return nil, fmt.Errorf("%s: service handler is nil", protocolName)
 	}
 	scalar, err := base64.StdEncoding.DecodeString(staticPrivB64)
 	if err != nil {
-		return nil, fmt.Errorf("ewp/v2.1: server_static_priv: %w", err)
+		return nil, fmt.Errorf("%s: server_static_priv: %w", protocolName, err)
 	}
 	if len(scalar) != X25519PubLen {
 		return nil, fmt.Errorf("%w: want %d bytes, got %d", ErrStaticPriv, X25519PubLen, len(scalar))
@@ -174,6 +199,7 @@ func NewServiceV21(h Handler, staticPrivB64 string) (*ServiceV21, error) {
 		handler:    h,
 		staticPriv: priv,
 		replay:     NewReplayCache(ReplayWindow),
+		version:    version,
 	}
 	s.rebuildLookup()
 	return s, nil
@@ -297,39 +323,40 @@ func (s *ServiceV21) handleTransport(ctx context.Context, tr MessageTransport, u
 	s.usersMu.RUnlock()
 	if lookup == nil {
 		_ = tr.Close()
-		return errors.New("ewp/v2.1: no users configured")
+		return fmt.Errorf("%s: no users configured", suiteForVersion(s.version).name)
 	}
 
-	if dl, ok := ctx.Deadline(); ok {
-		if dc, ok := tr.(deadlineSetter); ok {
-			_ = dc.SetDeadline(dl)
-		}
-	}
+	hctx, finish := beginHandshake(ctx, tr)
+	defer finish()
+	suite := suiteForVersion(s.version)
 
-	helloIn, err := tr.ReadMessage()
+	helloIn, err := readMessageContext(hctx, tr)
 	if err != nil {
 		_ = tr.Close()
-		return fmt.Errorf("ewp/v2.1: read ClientHello: %w", err)
+		return fmt.Errorf("%s: read ClientHello: %w", suite.name, err)
 	}
-	helloOut, res, err := AcceptClientHelloV21WithReplay(helloIn, lookup, staticPriv, replay)
+	helloOut, res, err := acceptClientHelloV2x(helloIn, lookup, staticPriv, replay, suite)
 	if err != nil {
 		_ = tr.Close()
-		return fmt.Errorf("ewp/v2.1: accept ClientHello: %w", err)
+		return fmt.Errorf("%s: accept ClientHello: %w", suite.name, err)
 	}
-	if err := tr.SendMessage(helloOut); err != nil {
+	if err := sendMessageContext(hctx, tr, helloOut); err != nil {
 		_ = tr.Close()
-		return fmt.Errorf("ewp/v2.1: send ServerHello: %w", err)
+		return fmt.Errorf("%s: send ServerHello: %w", suite.name, err)
 	}
 
-	stream, err := NewServerSecureStream(tr, res.Keys)
+	var stream *SecureStream
+	if s.version == protocolVersionV22 {
+		stream, err = NewServerSecureStreamV22(tr, res.Keys)
+	} else {
+		stream, err = NewServerSecureStream(tr, res.Keys)
+	}
 	if err != nil {
 		_ = tr.Close()
-		return fmt.Errorf("ewp/v2.1: build server SecureStream: %w", err)
+		return fmt.Errorf("%s: build server SecureStream: %w", suite.name, err)
 	}
 
-	if dc, ok := tr.(deadlineSetter); ok {
-		_ = dc.SetDeadline(time.Time{})
-	}
+	finish()
 
 	meta := Metadata{
 		UserUUID:    res.ClientHello.UUID,
@@ -342,16 +369,17 @@ func (s *ServiceV21) handleTransport(ctx context.Context, tr MessageTransport, u
 	switch res.ClientHello.Command {
 	case CommandTCP:
 		appConn := &streamConn{SecureStream: stream, underlying: underlying}
+		appConn.shaper = NewStreamShaper(stream, DefaultShaperConfig())
 		return s.handler.NewConnection(ctx, appConn, meta)
 	case CommandUDP:
 		ev, err := stream.Recv()
 		if err != nil {
 			_ = stream.Close()
-			return fmt.Errorf("ewp/v2.1: read initial UDP_NEW: %w", err)
+			return fmt.Errorf("%s: read initial UDP_NEW: %w", suite.name, err)
 		}
 		if ev.Type != FrameUDPNew {
 			_ = stream.Close()
-			return fmt.Errorf("ewp/v2.1: expected UDP_NEW first, got frame type %d", ev.Type)
+			return fmt.Errorf("%s: expected UDP_NEW first, got frame type %d", suite.name, ev.Type)
 		}
 		dst := res.ClientHello.Address
 		if ev.HasAddr {
@@ -361,7 +389,7 @@ func (s *ServiceV21) handleTransport(ctx context.Context, tr MessageTransport, u
 		return s.handler.NewPacketConnection(ctx, appPC, meta)
 	default:
 		_ = stream.Close()
-		return fmt.Errorf("ewp/v2.1: unsupported command %d", res.ClientHello.Command)
+		return fmt.Errorf("%s: unsupported command %d", suite.name, res.ClientHello.Command)
 	}
 }
 

@@ -2,6 +2,7 @@ package ewp
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -36,6 +37,11 @@ func makeReplayKey(uuid [UUIDLen]byte, nonce [HandshakeNonce]byte) replayKey {
 // single byte mask.
 const replayShardCount = 16
 
+// maxReplayEntries is a fail-closed memory bound. A full cache rejects new
+// admissions until expired entries are collected instead of allowing an
+// authenticated client to grow the process indefinitely.
+const maxReplayEntries = 1 << 18
+
 // gcInterval is how many MarkSeenOrReject calls per shard between
 // opportunistic sweeps. The background ticker also sweeps periodically;
 // the per-shard counter exists so a shard that admits a sudden burst
@@ -60,7 +66,7 @@ const minGCTick = 100 * time.Millisecond
 // replayShard is a single mutex-guarded map of recently-seen keys.
 type replayShard struct {
 	mu        sync.Mutex
-	entries   map[replayKey]int64 // value: unix-second expiry
+	entries   map[replayKey]time.Time // value: expiry with monotonic clock reading
 	gcCounter uint32
 }
 
@@ -80,6 +86,7 @@ type replayShard struct {
 type ReplayCache struct {
 	shards [replayShardCount]replayShard
 	window time.Duration
+	total  atomic.Uint64
 
 	stopCh   chan struct{}
 	doneCh   chan struct{}
@@ -93,13 +100,23 @@ type ReplayCache struct {
 // expired entries every gcTickInterval. Call (*ReplayCache).Close to
 // terminate it; for a process-lifetime Service this is optional.
 func NewReplayCache(window time.Duration) *ReplayCache {
+	if window < ReplayWindow {
+		// A shorter window would let a still-valid ClientHello outlive the
+		// cache and silently re-enable replay. Keep the public constructor
+		// fail-closed; short windows are available only to package tests.
+		window = ReplayWindow
+	}
+	return newReplayCache(window)
+}
+
+func newReplayCache(window time.Duration) *ReplayCache {
 	c := &ReplayCache{
 		window: window,
 		stopCh: make(chan struct{}),
 		doneCh: make(chan struct{}),
 	}
 	for i := range c.shards {
-		c.shards[i].entries = make(map[replayKey]int64)
+		c.shards[i].entries = make(map[replayKey]time.Time)
 	}
 	go c.gcLoop()
 	return c
@@ -128,13 +145,14 @@ func (c *ReplayCache) gcLoop() {
 		case <-c.stopCh:
 			return
 		case <-t.C:
-			now := time.Now().Unix()
+			now := time.Now()
 			for i := range c.shards {
 				s := &c.shards[i]
 				s.mu.Lock()
 				for k, exp := range s.entries {
-					if exp <= now {
+					if !exp.After(now) {
 						delete(s.entries, k)
+						c.total.Add(^uint64(0))
 					}
 				}
 				s.mu.Unlock()
@@ -143,13 +161,19 @@ func (c *ReplayCache) gcLoop() {
 	}
 }
 
-// shardOf maps a key to one of the shards. We use the first byte of
-// the UUID portion of the key — the UUID is high-entropy enough that
-// two different users effectively never collide on the same shard,
-// and within a single user the nonce randomness spreads independent
-// admits uniformly.
+// shardOf maps the complete replay key across shards. Using all key bytes is
+// important because a single user can generate an unbounded sequence of
+// nonces; selecting only from the UUID would put all of that load on one lock.
 func (c *ReplayCache) shardOf(k replayKey) *replayShard {
-	idx := uint(k[0]) & (replayShardCount - 1)
+	// FNV-1a is used only for lock distribution. The replay key is already
+	// authenticated before it reaches this cache, so a cryptographic hash is
+	// unnecessary here.
+	h := uint32(2166136261)
+	for _, b := range k {
+		h ^= uint32(b)
+		h *= 16777619
+	}
+	idx := uint(h) & (replayShardCount - 1)
 	return &c.shards[idx]
 }
 
@@ -166,15 +190,22 @@ func (c *ReplayCache) MarkSeenOrReject(
 	uuid [UUIDLen]byte,
 	nonce [HandshakeNonce]byte,
 ) bool {
-	now := time.Now().Unix()
-	expiry := now + int64(c.window/time.Second)
+	now := time.Now()
+	expiry := now.Add(c.window)
 	key := makeReplayKey(uuid, nonce)
 	s := c.shardOf(key)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if exp, ok := s.entries[key]; ok && exp > now {
+	if exp, ok := s.entries[key]; ok {
+		if exp.After(now) {
+			return false
+		}
+		delete(s.entries, key)
+		c.total.Add(^uint64(0))
+	}
+	if !c.reserveEntry() {
 		return false
 	}
 	s.entries[key] = expiry
@@ -185,26 +216,32 @@ func (c *ReplayCache) MarkSeenOrReject(
 		// Per-shard opportunistic sweep. Keeps a hot shard from
 		// growing unboundedly between background ticks.
 		for k, exp := range s.entries {
-			if exp <= now {
+			if !exp.After(now) {
 				delete(s.entries, k)
+				c.total.Add(^uint64(0))
 			}
 		}
 	}
 	return true
 }
 
+func (c *ReplayCache) reserveEntry() bool {
+	for {
+		current := c.total.Load()
+		if current >= maxReplayEntries {
+			return false
+		}
+		if c.total.CompareAndSwap(current, current+1) {
+			return true
+		}
+	}
+}
+
 // Len returns the current number of remembered pairs across all
 // shards. Intended for metrics / tests; the value is racy by definition
 // under concurrent admits and should not be used for control flow.
 func (c *ReplayCache) Len() int {
-	total := 0
-	for i := range c.shards {
-		s := &c.shards[i]
-		s.mu.Lock()
-		total += len(s.entries)
-		s.mu.Unlock()
-	}
-	return total
+	return int(c.total.Load())
 }
 
 // ErrReplay is returned by AcceptClientHello when a ClientHello with a

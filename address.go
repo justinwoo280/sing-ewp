@@ -37,6 +37,11 @@ var ErrAddrType = errors.New("ewp/v2: unknown address type")
 // MaxDomainLen.
 var ErrDomainLen = errors.New("ewp/v2: invalid domain length")
 
+// ErrDomainSyntax is returned for a domain containing control characters or
+// invalid DNS label syntax. Rejecting these values at the codec boundary also
+// prevents them from becoming log-control sequences in callers.
+var ErrDomainSyntax = errors.New("ewp/v2: invalid domain syntax")
+
 // Address is the unified destination/source representation used by
 // EWP v2. Exactly one of (Addr, Domain) is meaningful.
 //
@@ -81,6 +86,9 @@ func (a Address) Append(dst []byte) ([]byte, error) {
 		if len(a.Domain) == 0 || len(a.Domain) > MaxDomainLen {
 			return dst, ErrDomainLen
 		}
+		if !validDomain(a.Domain) {
+			return dst, ErrDomainSyntax
+		}
 		dst = append(dst, byte(AddrTypeDomain), byte(len(a.Domain)))
 		dst = append(dst, a.Domain...)
 		dst = append(dst, byte(a.Port>>8), byte(a.Port))
@@ -102,6 +110,35 @@ func (a Address) Append(dst []byte) ([]byte, error) {
 	default:
 		return dst, fmt.Errorf("ewp/v2: invalid address: %+v", a)
 	}
+}
+
+func validDomain(domain string) bool {
+	labelStart := 0
+	for i := 0; i <= len(domain); i++ {
+		if i < len(domain) && domain[i] != '.' {
+			continue
+		}
+		if i == labelStart {
+			// Permit one trailing root dot, but no empty interior label.
+			return i == len(domain) && i > 0 && domain[i-1] == '.'
+		}
+		label := domain[labelStart:i]
+		if len(label) > 63 || !isDomainAlphaNumeric(label[0]) ||
+			!isDomainAlphaNumeric(label[len(label)-1]) {
+			return false
+		}
+		for j := 1; j < len(label)-1; j++ {
+			if !isDomainAlphaNumeric(label[j]) && label[j] != '-' {
+				return false
+			}
+		}
+		labelStart = i + 1
+	}
+	return true
+}
+
+func isDomainAlphaNumeric(b byte) bool {
+	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9'
 }
 
 // DecodeAddress parses a single Address from the front of buf and
@@ -142,6 +179,9 @@ func DecodeAddress(buf []byte) (Address, int, error) {
 			return Address{}, 0, ErrAddrTooShort
 		}
 		domain := string(buf[2 : 2+dlen])
+		if !validDomain(domain) {
+			return Address{}, 0, ErrDomainSyntax
+		}
 		port := binary.BigEndian.Uint16(buf[2+dlen : 2+dlen+2])
 		return Address{Domain: domain, Port: port}, 2 + dlen + 2, nil
 	default:

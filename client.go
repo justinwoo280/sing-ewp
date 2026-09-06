@@ -12,7 +12,10 @@ import (
 	"time"
 )
 
-// Client is the high-level EWP v2 client.
+// Client is the high-level legacy EWP v2 client.
+//
+// Deprecated: Use ClientV21. The legacy UUID-only handshake does not
+// authenticate the server and must not be used for new deployments.
 //
 // One Client = one configured user (UUID + protocol parameters). It is
 // safe to share across goroutines: each Dial call performs an
@@ -28,6 +31,8 @@ type Client struct {
 
 // NewClient parses a UUID string ("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 // or 32 hex digits) and returns a ready Client.
+//
+// Deprecated: Use NewClientV21 with the pinned server static public key.
 func NewClient(uuidStr string) (*Client, error) {
 	u, err := ParseUUID(uuidStr)
 	if err != nil {
@@ -80,22 +85,20 @@ func (c *Client) DialPacketConn(ctx context.Context, conn net.Conn, dst Address)
 }
 
 // handshake runs WriteClientHello + ReadServerHello and returns the
-// post-handshake SecureStream. ctx deadline (if any) is honored by
-// applying a SetDeadline on the underlying conn.
+// post-handshake SecureStream. It applies DefaultHandshakeTimeout unless ctx
+// has an earlier deadline, and cancellation closes the transport.
 func (c *Client) handshake(ctx context.Context, tr MessageTransport, cmd Command, dst Address) (*SecureStream, error) {
-	if dl, ok := ctx.Deadline(); ok {
-		if dc, ok := tr.(deadlineSetter); ok {
-			_ = dc.SetDeadline(dl)
-			defer func() { _ = dc.SetDeadline(time.Time{}) }()
-		}
-	}
+	hctx, finish := beginHandshake(ctx, tr)
+	defer finish()
 
-	state, err := WriteClientHello(tr.SendMessage, c.uuid, cmd, dst)
+	state, err := WriteClientHello(func(msg []byte) error {
+		return sendMessageContext(hctx, tr, msg)
+	}, c.uuid, cmd, dst)
 	if err != nil {
 		_ = tr.Close()
 		return nil, fmt.Errorf("ewp: write ClientHello: %w", err)
 	}
-	shBytes, err := tr.ReadMessage()
+	shBytes, err := readMessageContext(hctx, tr)
 	if err != nil {
 		_ = tr.Close()
 		return nil, fmt.Errorf("ewp: read ServerHello: %w", err)
@@ -132,8 +135,7 @@ type streamConn struct {
 	// longer mirrors the inner protocol. Writes go through it; it
 	// still funnels every frame through SecureStream so all bytes stay
 	// padded + AEAD-sealed. Nil means writes go straight to
-	// SecureStream.SendTCPData (legacy behaviour, used by the server
-	// side and by callers that opt out).
+	// SecureStream.SendTCPData for callers that opt out.
 	shaper *StreamShaper
 
 	readMu  sync.Mutex
@@ -165,7 +167,9 @@ func (c *streamConn) Read(p []byte) (int, error) {
 		default:
 			// In TCP mode any other frame type (UDP, probe...) is a
 			// protocol violation from the peer.
-			return 0, fmt.Errorf("ewp: unexpected frame type %d in TCP stream", ev.Type)
+			err := fmt.Errorf("ewp: unexpected frame type %d in TCP stream", ev.Type)
+			_ = c.SecureStream.Close()
+			return 0, err
 		}
 	}
 	n := copy(p, c.readBuf)
@@ -206,8 +210,8 @@ func (c *streamConn) Write(p []byte) (int, error) {
 func (c *streamConn) Close() error {
 	c.closeOnce.Do(func() {
 		if c.shaper != nil {
-			// Flush residual buffered bytes and stop the cover loop
-			// before tearing down the stream.
+			// Stop scheduling writes and close the stream before waiting for a
+			// cover send. A non-reading peer must not make Close block forever.
 			if err := c.shaper.Close(); err != nil && c.closeErr == nil {
 				c.closeErr = err
 			}

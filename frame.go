@@ -60,13 +60,14 @@ const (
 
 // Errors surfaced by frame encode/decode.
 var (
-	ErrFrameTooLarge   = errors.New("ewp/v2: frame exceeds MaxFrameSize")
-	ErrFrameTooShort   = errors.New("ewp/v2: frame body shorter than declared length")
-	ErrFrameType       = errors.New("ewp/v2: unknown frame type")
-	ErrMetaTooLarge    = errors.New("ewp/v2: meta exceeds MaxMetaLen")
-	ErrPadTooLarge     = errors.New("ewp/v2: pad exceeds MaxFramePad")
-	ErrAEADOpen        = errors.New("ewp/v2: AEAD open failed")
-	ErrCounterMismatch = errors.New("ewp/v2: counter mismatch (replay or reorder)")
+	ErrFrameTooLarge    = errors.New("ewp/v2: frame exceeds MaxFrameSize")
+	ErrFrameTooShort    = errors.New("ewp/v2: frame body shorter than declared length")
+	ErrFrameType        = errors.New("ewp/v2: unknown frame type")
+	ErrMetaTooLarge     = errors.New("ewp/v2: meta exceeds MaxMetaLen")
+	ErrPadTooLarge      = errors.New("ewp/v2: pad exceeds MaxFramePad")
+	ErrAEADOpen         = errors.New("ewp/v2: AEAD open failed")
+	ErrCounterMismatch  = errors.New("ewp/v2: counter mismatch (replay or reorder)")
+	ErrCounterExhausted = errors.New("ewp/v2: frame counter exhausted")
 )
 
 // FrameAEAD wraps a directional ChaCha20-Poly1305 cipher together with
@@ -84,6 +85,16 @@ type FrameAEAD struct {
 	// than the cipher.AEAD itself (which retains the expanded round
 	// keys); both are wiped when the SecureStream is closed.
 	key [AEADKeyLen]byte
+}
+
+func (f *FrameAEAD) wipe() {
+	if f == nil {
+		return
+	}
+	zero(f.key[:])
+	zero(f.prefix[:])
+	f.aead = nil
+	f.counter = 0
 }
 
 // NewFrameAEAD constructs a per-direction AEAD context.
@@ -118,8 +129,16 @@ func (f *FrameAEAD) composeNonce(counter uint64) [AEADNonceLen]byte {
 // pseudo-random padLen drawn from a sane distribution; this function
 // fills the pad bytes with crypto/rand.
 //
-// EncodeFrame increments the AEAD counter on success.
+// EncodeFrame increments the AEAD counter on success. Callers must rekey
+// before the counter is exhausted, because no nonce remains to send a rekey
+// announcement after exhaustion.
 func EncodeFrame(w io.Writer, f *FrameAEAD, t FrameType, meta, payload []byte, padLen int) error {
+	if f == nil || f.aead == nil {
+		return io.ErrClosedPipe
+	}
+	if f.counter == ^uint64(0) {
+		return ErrCounterExhausted
+	}
 	if !t.Valid() {
 		return ErrFrameType
 	}
@@ -208,6 +227,12 @@ type DecodedFrame struct {
 // principle, but callers MUST treat any error as fatal for the
 // SecureStream and stop reading.
 func DecodeFrame(r io.Reader, f *FrameAEAD) (*DecodedFrame, error) {
+	if f == nil || f.aead == nil {
+		return nil, io.ErrClosedPipe
+	}
+	if f.counter == ^uint64(0) {
+		return nil, ErrCounterExhausted
+	}
 	var hdr [frameHeaderSize]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, err

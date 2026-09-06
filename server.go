@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"sync"
-	"time"
 )
 
 // Handler is the application-side hook invoked by Service after a
@@ -46,7 +45,10 @@ type Metadata struct {
 	Source net.Addr
 }
 
-// Service is the high-level EWP v2 server.
+// Service is the high-level legacy EWP v2 server.
+//
+// Deprecated: Use ServiceV21. The legacy UUID-only handshake does not
+// authenticate the server and must not be used for new deployments.
 //
 // The Service does NOT own a listener: the caller is responsible for
 // accepting underlying transport connections (TLS, WebSocket, etc.)
@@ -74,6 +76,8 @@ type Service struct {
 // The returned Service has anti-replay enabled by default with a
 // ReplayWindow-sized cache; call SetReplayCache to override (e.g. to
 // install a custom-sized cache or disable for tests).
+//
+// Deprecated: Use NewServiceV21 with a server static private key.
 func NewService(h Handler) *Service {
 	if h == nil {
 		panic("ewp: NewService: handler is nil")
@@ -189,8 +193,8 @@ func (s *Service) rebuildLookup() {
 // HandleConn returns when the handler finishes (or on any handshake
 // error). It always closes conn before returning.
 //
-// ctx is forwarded to the handler. Its deadline (if any) bounds the
-// handshake itself.
+// ctx is forwarded to the handler. The handshake uses DefaultHandshakeTimeout
+// unless ctx supplies an earlier deadline.
 func (s *Service) HandleConn(ctx context.Context, conn net.Conn) error {
 	tr := NewLengthFramer(conn)
 	return s.handleTransport(ctx, tr, conn)
@@ -216,13 +220,10 @@ func (s *Service) handleTransport(ctx context.Context, tr MessageTransport, unde
 		return errors.New("ewp: no users configured")
 	}
 
-	if dl, ok := ctx.Deadline(); ok {
-		if dc, ok := tr.(deadlineSetter); ok {
-			_ = dc.SetDeadline(dl)
-		}
-	}
+	hctx, finish := beginHandshake(ctx, tr)
+	defer finish()
 
-	helloIn, err := tr.ReadMessage()
+	helloIn, err := readMessageContext(hctx, tr)
 	if err != nil {
 		_ = tr.Close()
 		return fmt.Errorf("ewp: read ClientHello: %w", err)
@@ -232,7 +233,7 @@ func (s *Service) handleTransport(ctx context.Context, tr MessageTransport, unde
 		_ = tr.Close()
 		return fmt.Errorf("ewp: accept ClientHello: %w", err)
 	}
-	if err := tr.SendMessage(helloOut); err != nil {
+	if err := sendMessageContext(hctx, tr, helloOut); err != nil {
 		_ = tr.Close()
 		return fmt.Errorf("ewp: send ServerHello: %w", err)
 	}
@@ -243,10 +244,8 @@ func (s *Service) handleTransport(ctx context.Context, tr MessageTransport, unde
 		return fmt.Errorf("ewp: build server SecureStream: %w", err)
 	}
 
-	// Clear any handshake deadline before yielding to the handler.
-	if dc, ok := tr.(deadlineSetter); ok {
-		_ = dc.SetDeadline(time.Time{})
-	}
+	// Clear the handshake deadline before yielding to the handler.
+	finish()
 
 	meta := Metadata{
 		UserUUID:    res.ClientHello.UUID,

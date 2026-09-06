@@ -116,8 +116,8 @@ func VerifyOuterMAC(uuid [UUIDLen]byte, msg []byte, tag [OuterMACLen]byte) bool 
 	return hmac.Equal(want[:], tag[:])
 }
 
-// SessionKeys holds the derived per-direction keys produced by
-// DeriveSessionKeys.
+// SessionKeys holds the derived per-direction keys produced by the
+// version-matched session derivation function.
 //
 // SessionID is an 8-byte opaque identifier derived from the same PRK
 // as the per-direction keys but with its own HKDF info label. It is
@@ -138,11 +138,15 @@ type SessionKeys struct {
 	C2SNonce  [NoncePrefixLen]byte
 	S2CNonce  [NoncePrefixLen]byte
 	SessionID [8]byte
+
+	version protocolVersion
 }
 
-// DeriveSessionKeys runs HKDF-Extract+Expand using the hybrid IKM
+// DeriveSessionKeys runs the legacy/v2.1 HKDF-Extract+Expand using the hybrid IKM
 // (X25519 ‖ ML-KEM shared secret) and salt = "EWPv2-salt" || cNonce ||
 // sNonceEcho.
+//
+// Use DeriveSessionKeysV22 for an opaque-record v2.2 stream.
 //
 // Both nonces are the literal handshake-nonce fields exchanged in
 // ClientHello and ServerHello; sNonceEcho MUST equal cNonce in
@@ -154,13 +158,35 @@ func DeriveSessionKeys(
 	clientNonce [HandshakeNonce]byte,
 	serverNonceEcho [HandshakeNonce]byte,
 ) SessionKeys {
+	return deriveSessionKeys(&v21Suite, x25519Shared, mlkemShared, clientNonce, serverNonceEcho)
+}
+
+// DeriveSessionKeysV22 derives v2.2 traffic keys under labels distinct from
+// v2.1. The returned keys can only be used with the v2.2 SecureStream
+// constructors.
+func DeriveSessionKeysV22(
+	x25519Shared [X25519PubLen]byte,
+	mlkemShared []byte,
+	clientNonce [HandshakeNonce]byte,
+	serverNonceEcho [HandshakeNonce]byte,
+) SessionKeys {
+	return deriveSessionKeys(&v22Suite, x25519Shared, mlkemShared, clientNonce, serverNonceEcho)
+}
+
+func deriveSessionKeys(
+	suite *protocolSuite,
+	x25519Shared [X25519PubLen]byte,
+	mlkemShared []byte,
+	clientNonce [HandshakeNonce]byte,
+	serverNonceEcho [HandshakeNonce]byte,
+) SessionKeys {
 	// IKM = classical || PQ
 	ikm := make([]byte, 0, X25519PubLen+len(mlkemShared))
 	ikm = append(ikm, x25519Shared[:]...)
 	ikm = append(ikm, mlkemShared...)
 
-	salt := make([]byte, 0, len(infoSaltPrefix)+HandshakeNonce*2)
-	salt = append(salt, infoSaltPrefix...)
+	salt := make([]byte, 0, len(suite.sessionSalt)+HandshakeNonce*2)
+	salt = append(salt, suite.sessionSalt...)
 	salt = append(salt, clientNonce[:]...)
 	salt = append(salt, serverNonceEcho[:]...)
 
@@ -168,21 +194,22 @@ func DeriveSessionKeys(
 	prk := hkdf.Extract(sha256.New, ikm, salt)
 
 	var sk SessionKeys
-	if err := expand(prk, infoC2SKey, sk.C2SKey[:]); err != nil {
-		panic("ewp/v2: derive C2S key: " + err.Error())
+	if err := expand(prk, suite.c2sKey, sk.C2SKey[:]); err != nil {
+		panic(suite.name + ": derive C2S key: " + err.Error())
 	}
-	if err := expand(prk, infoS2CKey, sk.S2CKey[:]); err != nil {
-		panic("ewp/v2: derive S2C key: " + err.Error())
+	if err := expand(prk, suite.s2cKey, sk.S2CKey[:]); err != nil {
+		panic(suite.name + ": derive S2C key: " + err.Error())
 	}
-	if err := expand(prk, infoC2SNonce, sk.C2SNonce[:]); err != nil {
-		panic("ewp/v2: derive C2S nonce: " + err.Error())
+	if err := expand(prk, suite.c2sNonce, sk.C2SNonce[:]); err != nil {
+		panic(suite.name + ": derive C2S nonce: " + err.Error())
 	}
-	if err := expand(prk, infoS2CNonce, sk.S2CNonce[:]); err != nil {
-		panic("ewp/v2: derive S2C nonce: " + err.Error())
+	if err := expand(prk, suite.s2cNonce, sk.S2CNonce[:]); err != nil {
+		panic(suite.name + ": derive S2C nonce: " + err.Error())
 	}
-	if err := expand(prk, infoSessionID, sk.SessionID[:]); err != nil {
-		panic("ewp/v2.1: derive SessionID: " + err.Error())
+	if err := expand(prk, suite.sessionID, sk.SessionID[:]); err != nil {
+		panic(suite.name + ": derive SessionID: " + err.Error())
 	}
+	sk.version = suite.version
 	return sk
 }
 

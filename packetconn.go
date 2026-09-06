@@ -20,8 +20,8 @@ import (
 //   - Inbound UDP_DATA frames decoded by SecureStream.Recv become
 //     ReadFrom returns.
 //
-// Concurrency: WriteTo and Close are goroutine-safe. ReadFrom must be
-// called from a single goroutine (matching SecureStream's contract).
+// Concurrency: WriteTo and Close are goroutine-safe. A single ReadFrom caller
+// is recommended for predictable datagram ordering.
 type packetConn struct {
 	stream     *SecureStream
 	underlying net.Conn
@@ -73,21 +73,6 @@ func newServerPacketConn(stream *SecureStream, underlying net.Conn,
 	}
 }
 
-// ensureOpen sends UDP_NEW exactly once. payload may be nil to open
-// the sub-session without an initial datagram.
-func (p *packetConn) ensureOpen(payload []byte) error {
-	p.openedMu.Lock()
-	defer p.openedMu.Unlock()
-	if p.opened {
-		return nil
-	}
-	if err := p.stream.SendUDPNew(p.globalID, p.defaultDst, payload); err != nil {
-		return err
-	}
-	p.opened = true
-	return nil
-}
-
 // WriteTo sends b to addr through the EWP tunnel. addr may be a
 // *net.UDPAddr or an *net.IPAddr; FQDN destinations require callers
 // to use WriteToAddress (see below).
@@ -102,13 +87,15 @@ func (p *packetConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 // WriteToAddress is the EWP-native variant of WriteTo accepting an
 // EWP Address (which can carry FQDN destinations).
 func (p *packetConn) WriteToAddress(b []byte, target Address) (int, error) {
+	p.openedMu.Lock()
+	defer p.openedMu.Unlock()
 	if !p.isServer && !p.opened {
-		if err := p.ensureOpen(b); err == nil {
-			// Initial datagram piggy-backed on UDP_NEW.
-			return len(b), nil
-		} else {
+		if err := p.stream.SendUDPNew(p.globalID, p.defaultDst, b); err != nil {
 			return 0, err
 		}
+		p.opened = true
+		// Initial datagram piggy-backed on UDP_NEW.
+		return len(b), nil
 	}
 	if err := p.stream.SendUDPData(p.globalID, target, b); err != nil {
 		return 0, err
@@ -133,7 +120,7 @@ func (p *packetConn) ReadFrom(b []byte) (int, net.Addr, error) {
 			return 0, nil, err
 		}
 		switch ev.Type {
-		case FrameUDPData, FrameUDPNew:
+		case FrameUDPData:
 			if ev.GlobalID != p.globalID {
 				// Foreign sub-session in the same SecureStream — should
 				// not happen for a single PacketConn but skip safely.
@@ -151,6 +138,10 @@ func (p *packetConn) ReadFrom(b []byte) (int, net.Addr, error) {
 				src = ewpToNetAddr(p.defaultDst)
 			}
 			return n, src, nil
+		case FrameUDPNew:
+			err := fmt.Errorf("ewp: unexpected UDP_NEW on existing packet conn")
+			_ = p.stream.Close()
+			return 0, nil, err
 		case FrameUDPEnd:
 			if ev.GlobalID == p.globalID {
 				return 0, nil, io.EOF
@@ -160,13 +151,17 @@ func (p *packetConn) ReadFrom(b []byte) (int, net.Addr, error) {
 			FrameUDPProbeReq, FrameUDPProbeResp:
 			continue
 		default:
-			return 0, nil, fmt.Errorf("ewp: unexpected frame type %d on packet conn", ev.Type)
+			err := fmt.Errorf("ewp: unexpected frame type %d on packet conn", ev.Type)
+			_ = p.stream.Close()
+			return 0, nil, err
 		}
 	}
 }
 
 func (p *packetConn) Close() error {
 	p.closeOnce.Do(func() {
+		p.openedMu.Lock()
+		defer p.openedMu.Unlock()
 		// Best-effort UDP_END: ignore errors (peer may have closed)
 		// and bound the attempt with a short deadline so a dead peer
 		// can't hang Close indefinitely.

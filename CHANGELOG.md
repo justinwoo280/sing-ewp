@@ -5,6 +5,51 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## Unreleased - EWP/v2.2 opaque records
+
+- Added `ClientV22`, `ServiceV22`, explicit v2.2 handshake entry points, and
+  v2.2-only SecureStream constructors. v2.1 and v2.2 authentication labels
+  intentionally reject each other with no fallback.
+- Added the v2.2 record layout: the only visible field is a bucketized,
+  authenticated ciphertext length. Counter, type, metadata length, payload
+  length, and random padding are encrypted and authenticated inside the record.
+- Added distinct v2.2 outer-handshake, session, direction, and rekey labels.
+- Made direct `EncodeFrameV22` calls bucketize by default; the high-level
+  stream applies phase-aware bucket planning to application, rekey, and cover
+  records alike.
+- Added low-level malformed-record, key-domain, rekey, trailing-byte, TCP,
+  UDP, and V21/V22 no-dispatch regression coverage.
+- Added `EWP_V22.md` with the coordinated-cutover and no-fallback contract.
+
+## Unreleased - Security hardening follow-up
+
+This entry records follow-up work against the frozen
+`SECURITY_AUDIT_BASELINE_AND_REMEDIATION_PLAN.md` baseline. It does not grant
+strict-security approval.
+
+- Deprecated the UUID-only `Client`, `Service`, `NewClient`, `NewService`,
+  `WriteClientHello`, and legacy accept APIs. This was superseded for new
+  deployments by the v2.2 constructors with a pinned server static public key.
+- Added a default handshake timeout and cancellation path that closes a
+  blocking message transport.
+- Hardened `ReplayCache` with a minimum public replay window, monotonic expiry
+  timestamps, full-key shard selection, and a fail-closed global capacity cap.
+- Refused frame-counter exhaustion, rejected trailing frame and UDP metadata
+  bytes, terminated mode-inappropriate TCP/UDP frames, and clear frame AEAD
+  references on close and transport failures.
+- Made concurrent UDP first writes atomic and serialized traffic-shaper flushes
+  so a slow transport cannot reorder application flushes.
+- StreamShaper now records asynchronous flush and cover-send failures, rejects
+  later writes, and bounds graceful close before interrupting a blocked peer.
+- Installed the shaper on high-level v2.1 TCP paths and use `crypto/rand` for
+  observable padding and timing choices.
+- `Rekey` is documented as one-way key evolution. It provides backward secrecy
+  for prior epochs, not post-compromise recovery.
+- Current limits remain material: v2.1 frame records expose exact payload
+  lengths, ClientHello replay state is process-local, v2.2 authenticates after
+  static ECDH/candidate work, and ClientHello metadata is not forward secret
+  after static-private-key plus UUID compromise.
+
 ## v0.2.6 — Service lifecycle cleanup
 
 - Added `Close` methods to the EWP services so their anti-replay cache
