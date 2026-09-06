@@ -1,6 +1,7 @@
 package ewp
 
 import (
+	"bytes"
 	crand "crypto/rand"
 	"encoding/binary"
 	"io"
@@ -89,7 +90,7 @@ func encodeFrameV22WithPad(w io.Writer, f *FrameAEAD, t FrameType, meta, payload
 	var outer [v22OuterLengthSize]byte
 	binary.BigEndian.PutUint32(outer[:], uint32(recordLen))
 
-	plain := make([]byte, plainLen)
+	plain := f.scratchBuf(plainLen)
 	binary.BigEndian.PutUint64(plain[0:v22InnerCounterLen], counter)
 	plain[v22InnerCounterLen] = byte(t)
 	binary.BigEndian.PutUint16(plain[v22InnerCounterLen+v22InnerTypeLen:v22InnerCounterLen+v22InnerTypeLen+v22InnerMetaLen], uint16(len(meta)))
@@ -107,6 +108,24 @@ func encodeFrameV22WithPad(w io.Writer, f *FrameAEAD, t FrameType, meta, payload
 	}
 
 	nonce := f.composeNonce(counter)
+	// When the sink is a *bytes.Buffer (the SecureStream send path),
+	// seal directly into its spare capacity so the ciphertext never
+	// touches a separate heap allocation. Generic writers fall back to
+	// a sealed temporary slice.
+	if buf, ok := w.(*bytes.Buffer); ok {
+		buf.Grow(v22OuterLengthSize + recordLen)
+		if _, err := buf.Write(outer[:]); err != nil {
+			return err
+		}
+		avail := buf.Bytes()
+		avail = avail[len(avail):cap(avail)]
+		ciphertext := f.aead.Seal(avail[:0], nonce[:], plain, outer[:])
+		if _, err := buf.Write(ciphertext); err != nil {
+			return err
+		}
+		f.counter = counter + 1
+		return nil
+	}
 	ciphertext := f.aead.Seal(nil, nonce[:], plain, outer[:])
 	if _, err := w.Write(outer[:]); err != nil {
 		return err
@@ -142,13 +161,13 @@ func DecodeFrameV22(r io.Reader, f *FrameAEAD) (*DecodedFrame, error) {
 		return nil, ErrFrameTooLarge
 	}
 
-	ciphertext := make([]byte, int(recordLen))
+	ciphertext := f.scratchBuf(int(recordLen))
 	if _, err := io.ReadFull(r, ciphertext); err != nil {
 		return nil, err
 	}
 	counter := f.counter
 	nonce := f.composeNonce(counter)
-	plain, err := f.aead.Open(nil, nonce[:], ciphertext, outer[:])
+	plain, err := f.aead.Open(ciphertext[:0], nonce[:], ciphertext, outer[:])
 	if err != nil {
 		return nil, ErrAEADOpen
 	}

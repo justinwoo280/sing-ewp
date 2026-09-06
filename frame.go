@@ -85,6 +85,13 @@ type FrameAEAD struct {
 	// than the cipher.AEAD itself (which retains the expanded round
 	// keys); both are wiped when the SecureStream is closed.
 	key [AEADKeyLen]byte
+	// scratch is a reusable plaintext assembly buffer for the v2.2
+	// opaque record codec (encode side) and a reusable ciphertext
+	// read buffer (decode side). FrameAEAD is not goroutine-safe and
+	// SecureStream serialises access, so a single scratch per FrameAEAD
+	// is safe and removes the per-record heap allocation from the hot
+	// path. scratch is grown as needed and wiped on Close.
+	scratch []byte
 }
 
 func (f *FrameAEAD) wipe() {
@@ -93,8 +100,21 @@ func (f *FrameAEAD) wipe() {
 	}
 	zero(f.key[:])
 	zero(f.prefix[:])
+	zero(f.scratch)
+	f.scratch = nil
 	f.aead = nil
 	f.counter = 0
+}
+
+// scratchBuf returns a scratch buffer of at least size bytes, growing
+// the retained buffer if necessary. The returned slice is exactly size
+// bytes long and shares backing store with f.scratch; the caller must
+// not retain it across the next scratchBuf call.
+func (f *FrameAEAD) scratchBuf(size int) []byte {
+	if cap(f.scratch) < size {
+		f.scratch = make([]byte, size)
+	}
+	return f.scratch[:size]
 }
 
 // NewFrameAEAD constructs a per-direction AEAD context.
