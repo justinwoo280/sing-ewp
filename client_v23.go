@@ -318,9 +318,32 @@ func (s *ServiceV23) handleTransport(ctx context.Context, tr MessageTransport, u
 
 	switch res.ClientHello.Command {
 	case CommandTCP:
-		appConn := &streamConn{SecureStream: stream, underlying: underlying}
+		// The host handler may hand the connection to an asynchronous
+		// router and return from NewConnection immediately (sing-box's
+		// RouteConnectionEx does exactly that). If we returned right
+		// away, the caller of HandleConn would consider the flow done
+		// and tear down the carrier underneath the router — transports
+		// whose handler lifetime equals the connection lifetime (gRPC:
+		// the Tun handler returns → stream closes) break instantly.
+		// Wait until the connection is actually closed (or the service
+		// is shut down) before returning. A handler that returns an
+		// error still tears the carrier down immediately.
+		connClosed := make(chan struct{})
+		appConn := &streamConn{
+			SecureStream: stream,
+			underlying:   underlying,
+			onClose:      func() { close(connClosed) },
+		}
 		appConn.shaper = NewStreamShaper(stream, DefaultShaperConfig())
-		return s.handler.NewConnection(ctx, appConn, meta)
+		if err := s.handler.NewConnection(ctx, appConn, meta); err != nil {
+			_ = stream.Close()
+			return err
+		}
+		select {
+		case <-connClosed:
+		case <-ctx.Done():
+		}
+		return nil
 	case CommandUDP:
 		ev, err := stream.Recv()
 		if err != nil {
@@ -335,8 +358,24 @@ func (s *ServiceV23) handleTransport(ctx context.Context, tr MessageTransport, u
 		if ev.HasAddr {
 			dst = ev.Address
 		}
+		// Same handoff rule as the TCP branch: the host may dispatch the
+		// packet session to an asynchronous router and return from
+		// NewPacketConnection immediately. Wait for the session to close
+		// (or the service to shut down) before returning, so transports
+		// whose handler lifetime equals the connection lifetime (gRPC)
+		// do not tear the carrier down underneath the router.
+		pcClosed := make(chan struct{})
 		appPC := newServerPacketConn(stream, underlying, ev.GlobalID, dst, ev.Payload)
-		return s.handler.NewPacketConnection(ctx, appPC, meta)
+		appPC.onClose = func() { close(pcClosed) }
+		if err := s.handler.NewPacketConnection(ctx, appPC, meta); err != nil {
+			_ = stream.Close()
+			return err
+		}
+		select {
+		case <-pcClosed:
+		case <-ctx.Done():
+		}
+		return nil
 	default:
 		_ = stream.Close()
 		return fmt.Errorf("ewp/v2.3: unsupported command %d", res.ClientHello.Command)

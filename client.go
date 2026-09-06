@@ -138,6 +138,11 @@ type streamConn struct {
 	// SecureStream.SendTCPData for callers that opt out.
 	shaper *StreamShaper
 
+	// onClose, when non-nil, fires exactly once after Close completes.
+	// ServiceV23's handleTransport uses it to keep the carrier alive for
+	// the whole life of an asynchronously-handled connection.
+	onClose func()
+
 	readMu  sync.Mutex
 	readBuf []byte // unread portion of last decoded TCP DATA payload
 
@@ -223,6 +228,9 @@ func (c *streamConn) Close() error {
 			if err := c.underlying.Close(); err != nil && c.closeErr == nil {
 				c.closeErr = err
 			}
+		}
+		if c.onClose != nil {
+			c.onClose()
 		}
 	})
 	return c.closeErr

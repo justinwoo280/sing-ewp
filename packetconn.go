@@ -38,6 +38,11 @@ type packetConn struct {
 	pendingFirst    []byte
 	pendingFirstSrc Address
 
+	// onClose, when non-nil, fires exactly once after Close completes.
+	// ServiceV23's handleTransport uses it to keep the carrier alive for
+	// the whole life of an asynchronously-handled packet session.
+	onClose func()
+
 	openedMu sync.Mutex
 	opened   bool
 
@@ -175,6 +180,9 @@ func (p *packetConn) Close() error {
 			if err := p.underlying.Close(); err != nil && p.closeErr == nil {
 				p.closeErr = err
 			}
+		}
+		if p.onClose != nil {
+			p.onClose()
 		}
 	})
 	return p.closeErr
