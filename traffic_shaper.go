@@ -1,11 +1,15 @@
 package ewp
 
 import (
+	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-// Traffic shaping for the SecureStream send side (v0.2.x).
+// Optional traffic shaping for the EWP/v3 SecureStream send side. ClientV3 and
+// ServiceV3 do not install it automatically; callers that need timing/burst
+// shaping may wrap an established stream explicitly.
 //
 // Padding (padding_policy.go) removes the *length* dimension of the
 // TLS-in-TLS fingerprint. It does NOT touch the *timing* / *burst*
@@ -77,6 +81,10 @@ const (
 	// Anchored to the top steady bucket so a full buffer maps onto one
 	// max-size frame rather than spilling into a second.
 	defaultMaxCoalesce = 16384
+
+	// shaperCloseFlushTimeout bounds graceful delivery during Close before the
+	// underlying transport is interrupted to release an in-flight cover send.
+	shaperCloseFlushTimeout = 100 * time.Millisecond
 )
 
 // StreamShaper wraps a *SecureStream and reshapes its send timeline.
@@ -85,50 +93,84 @@ const (
 // on mu. The background flush + cover goroutines are started lazily on
 // the first WriteTCP and torn down by Close.
 type StreamShaper struct {
-	s   *SecureStream
-	cfg ShaperConfig
+	s       *SecureStream
+	cfg     ShaperConfig
+	runtime v3Runtime
 
 	mu       sync.Mutex
+	sendMu   sync.Mutex
 	buf      []byte
 	flushTmr *time.Timer
 
 	lastActivity time.Time
 
-	started   bool
-	stop      chan struct{}
-	closeOnce sync.Once
-	wg        sync.WaitGroup
+	started     bool
+	stopped     atomic.Bool
+	closing     atomic.Bool
+	terminalErr error
+	stop        chan struct{}
+	stopOnce    sync.Once
+	closeOnce   sync.Once
+	closeErr    error
+	wg          sync.WaitGroup
 }
 
 // NewStreamShaper builds a shaper around s. A zero-value cfg disables
 // all shaping and WriteTCP degenerates to a direct SendTCPData, so the
 // shaper is always safe to install unconditionally.
 func NewStreamShaper(s *SecureStream, cfg ShaperConfig) *StreamShaper {
+	return newStreamShaperWithRuntime(s, cfg, productionV3Runtime())
+}
+
+func newStreamShaperWithRuntime(s *SecureStream, cfg ShaperConfig, runtime v3Runtime) *StreamShaper {
 	return &StreamShaper{
 		s:            s,
 		cfg:          cfg,
+		runtime:      runtime,
 		stop:         make(chan struct{}),
-		lastActivity: time.Now(),
+		lastActivity: runtime.nowTime(),
 	}
 }
 
 // WriteTCP submits application bytes for shaped delivery. The bytes
 // are copied; the caller may reuse p immediately on return.
 func (h *StreamShaper) WriteTCP(p []byte) error {
+	if h.closing.Load() || h.stopped.Load() {
+		return h.terminalError()
+	}
 	if len(p) == 0 {
 		return nil
+	}
+	h.mu.Lock()
+	if h.closing.Load() {
+		h.mu.Unlock()
+		return io.ErrClosedPipe
+	}
+	if err := h.stateErrorLocked(); err != nil {
+		h.mu.Unlock()
+		return err
 	}
 	if h.cfg.FlushDelay <= 0 {
 		// Coalescing disabled: send directly but still record activity
 		// so the cover loop (if enabled) backs off.
-		h.touch()
-		return h.s.SendTCPData(p)
+		h.lastActivity = h.runtime.nowTime()
+		h.ensureStartedLocked()
+		h.mu.Unlock()
+		h.sendMu.Lock()
+		err := h.s.SendTCPData(p)
+		if err != nil {
+			h.signalStop()
+		}
+		h.sendMu.Unlock()
+		if err != nil {
+			h.finishStop(err)
+		}
+		return err
 	}
 
-	h.mu.Lock()
 	h.ensureStartedLocked()
 	h.buf = append(h.buf, p...)
-	h.lastActivity = time.Now()
+	h.lastActivity = h.runtime.nowTime()
 
 	maxCoalesce := h.cfg.MaxCoalesce
 	if maxCoalesce <= 0 {
@@ -136,12 +178,16 @@ func (h *StreamShaper) WriteTCP(p []byte) error {
 	}
 	if len(h.buf) >= maxCoalesce {
 		// Buffer full: flush synchronously to keep bulk throughput up.
-		return h.flushLocked()
+		err := h.flushLocked()
+		if err != nil {
+			h.finishStop(err)
+		}
+		return err
 	}
 	// Arm a flush timer if one is not already pending.
 	if h.flushTmr == nil {
 		delay := h.cfg.FlushDelay
-		if jit := randDuration(h.cfg.FlushDelay); jit > 0 {
+		if jit := randDurationWithReader(h.cfg.FlushDelay, h.runtime.reader()); jit > 0 {
 			delay = jit
 		}
 		h.flushTmr = time.AfterFunc(delay, h.onFlushTimer)
@@ -151,27 +197,46 @@ func (h *StreamShaper) WriteTCP(p []byte) error {
 }
 
 // onFlushTimer is the time.AfterFunc callback: it flushes whatever has
-// accumulated. Errors are swallowed here (the next WriteTCP / Recv will
-// observe the closed stream); the goroutine must not panic.
+// accumulated and records a terminal error so later writes cannot report
+// success for data that will never reach the peer.
 func (h *StreamShaper) onFlushTimer() {
+	if h.closing.Load() {
+		return
+	}
 	h.mu.Lock()
 	h.flushTmr = nil
-	_ = h.flushLocked()
+	if h.closing.Load() {
+		h.mu.Unlock()
+		return
+	}
+	if err := h.stateErrorLocked(); err != nil {
+		h.mu.Unlock()
+		return
+	}
+	err := h.flushLocked()
+	if err != nil {
+		h.finishStop(err)
+	}
 }
 
 // flushLocked drains the coalescing buffer in one or more frames. It is
-// called with mu held and RELEASES mu before returning (the actual
-// SendTCPData happens off-lock so a slow transport does not block
-// concurrent WriteTCP callers from buffering).
+// called with mu held and releases mu before the actual sends. sendMu is
+// acquired while mu is still held so flushes are emitted in buffer order.
 func (h *StreamShaper) flushLocked() error {
+	if err := h.stateErrorLocked(); err != nil {
+		h.mu.Unlock()
+		return err
+	}
 	if len(h.buf) == 0 {
 		h.mu.Unlock()
 		return nil
 	}
+	h.sendMu.Lock()
 	out := h.buf
 	h.buf = nil
-	h.lastActivity = time.Now()
+	h.lastActivity = h.runtime.nowTime()
 	h.mu.Unlock()
+	defer h.sendMu.Unlock()
 
 	maxPayload := MaxFrameSize - 256
 	var err error
@@ -183,16 +248,10 @@ func (h *StreamShaper) flushLocked() error {
 		err = h.s.SendTCPData(chunk)
 		out = out[len(chunk):]
 	}
+	if err != nil {
+		h.signalStop()
+	}
 	return err
-}
-
-// touch records send-side activity without buffering (used on the
-// no-coalesce fast path).
-func (h *StreamShaper) touch() {
-	h.mu.Lock()
-	h.lastActivity = time.Now()
-	h.ensureStartedLocked()
-	h.mu.Unlock()
 }
 
 // ensureStartedLocked lazily launches the cover-traffic goroutine. Must
@@ -214,7 +273,7 @@ func (h *StreamShaper) ensureStartedLocked() {
 func (h *StreamShaper) coverLoop() {
 	defer h.wg.Done()
 	for {
-		wait := h.cfg.CoverMinInterval + randDuration(h.cfg.CoverMaxInterval-h.cfg.CoverMinInterval)
+		wait := h.cfg.CoverMinInterval + randDurationWithReader(h.cfg.CoverMaxInterval-h.cfg.CoverMinInterval, h.runtime.reader())
 		if wait <= 0 {
 			wait = h.cfg.CoverMinInterval
 		}
@@ -225,20 +284,35 @@ func (h *StreamShaper) coverLoop() {
 			return
 		case <-t.C:
 		}
+		if h.closing.Load() {
+			return
+		}
 		if h.s.closed.Load() {
+			h.recordTerminal(io.ErrClosedPipe)
 			return
 		}
 		h.mu.Lock()
-		idle := time.Since(h.lastActivity)
+		if h.closing.Load() || h.stopped.Load() {
+			h.mu.Unlock()
+			return
+		}
+		idle := h.runtime.nowTime().Sub(h.lastActivity)
 		h.mu.Unlock()
 		if idle < h.cfg.CoverIdleAfter {
 			continue // recently active; real traffic is the cover
 		}
 		pad := h.cfg.CoverMaxPad
 		if pad > 0 {
-			pad = secureRandIntn(pad)
+			pad = secureRandIntn(pad, h.runtime.reader())
 		}
-		if err := h.s.SendCoverPad(pad); err != nil {
+		h.sendMu.Lock()
+		err := h.s.SendCoverPad(pad)
+		if err != nil {
+			h.signalStop()
+		}
+		h.sendMu.Unlock()
+		if err != nil {
+			h.finishStop(err)
 			return
 		}
 	}
@@ -247,30 +321,120 @@ func (h *StreamShaper) coverLoop() {
 // Flush forces any buffered bytes out immediately.
 func (h *StreamShaper) Flush() error {
 	h.mu.Lock()
+	if err := h.stateErrorLocked(); err != nil {
+		h.mu.Unlock()
+		return err
+	}
 	if h.flushTmr != nil {
 		h.flushTmr.Stop()
 		h.flushTmr = nil
 	}
-	return h.flushLocked()
+	err := h.flushLocked()
+	if err != nil {
+		h.finishStop(err)
+	}
+	return err
 }
 
-// Close stops the background goroutines and flushes residual bytes. It
-// does NOT close the underlying SecureStream (the owner does that).
+// Close rejects new writes, gives an already-buffered flush a short bounded
+// chance to finish, then closes the underlying SecureStream before waiting for
+// a blocked cover or flush send. A net.Conn Close cannot guarantee delivery of
+// buffered bytes; prioritising teardown prevents a non-reading peer from
+// hanging shutdown.
 func (h *StreamShaper) Close() error {
-	var err error
 	h.closeOnce.Do(func() {
-		err = h.Flush()
-		close(h.stop)
+		h.closeErr = h.close()
 	})
+	return h.closeErr
+}
+
+func (h *StreamShaper) close() error {
+	h.closing.Store(true)
+	flushDone := make(chan error, 1)
+	go func() { flushDone <- h.Flush() }()
+
+	timer := time.NewTimer(shaperCloseFlushTimeout)
+	var (
+		flushErr error
+		timedOut bool
+	)
+	select {
+	case flushErr = <-flushDone:
+		timer.Stop()
+	case <-timer.C:
+		timedOut = true
+	}
+
+	h.signalStop()
+	streamErr := h.s.Close()
+	if timedOut {
+		flushErr = <-flushDone
+	}
+	h.finishStop(nil)
 	h.wg.Wait()
-	return err
+	h.mu.Lock()
+	terminalErr := h.terminalErr
+	h.mu.Unlock()
+	if terminalErr != nil {
+		return terminalErr
+	}
+	if !timedOut && flushErr != nil {
+		return flushErr
+	}
+	return streamErr
+}
+
+func (h *StreamShaper) stateErrorLocked() error {
+	if h.terminalErr != nil {
+		return h.terminalErr
+	}
+	if h.stopped.Load() {
+		return io.ErrClosedPipe
+	}
+	return nil
+}
+
+func (h *StreamShaper) terminalError() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.terminalErr != nil {
+		return h.terminalErr
+	}
+	return io.ErrClosedPipe
+}
+
+func (h *StreamShaper) recordTerminal(err error) {
+	h.signalStop()
+	h.finishStop(err)
+}
+
+func (h *StreamShaper) signalStop() {
+	h.stopped.Store(true)
+	h.stopOnce.Do(func() { close(h.stop) })
+}
+
+func (h *StreamShaper) finishStop(err error) {
+	h.mu.Lock()
+	if err != nil && h.terminalErr == nil && !h.closing.Load() {
+		h.terminalErr = err
+	}
+	if h.flushTmr != nil {
+		h.flushTmr.Stop()
+		h.flushTmr = nil
+	}
+	h.buf = nil
+	h.mu.Unlock()
 }
 
 // randDuration returns a uniform random duration in [0, d). For d <= 0
 // it returns 0.
 func randDuration(d time.Duration) time.Duration {
+	return randDurationWithReader(d, productionV3Runtime().reader())
+}
+
+func randDurationWithReader(d time.Duration, random io.Reader) time.Duration {
 	if d <= 0 {
 		return 0
 	}
-	return time.Duration(secureRandIntn(int(d)))
+	return time.Duration(secureRandIntn(int(d), random))
 }

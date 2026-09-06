@@ -1,346 +1,110 @@
-# sing-ewp Usage Guide
+# EWP/v3 Usage
 
-This document shows how to embed `github.com/justinwoo280/sing-ewp` into a
-proxy framework (sing-box, mihomo, custom Go binary). The library is
-deliberately small and unopinionated: it implements the EWP v2 wire
-protocol and gives you `net.Conn` / `net.PacketConn` adapters; it does
-not decide what transport you run it over (TLS, WebSocket, gRPC, h3,
-plain TCP — all work).
+`sing-ewp` owns the EWP/v3 handshake and encrypted application records. TLS,
+HTTP, WebSocket, gRPC, and XHTTP are outer transports; they only provide a
+`net.Conn` or `MessageTransport` and do not inspect EWP bytes.
 
-## Quick mental model
-
-```
-+--------------------------+
-|  application bytes       |
-+--------------------------+
-|  ewp.Client / ewp.Service  ← this library
-+--------------------------+
-|  TLS (with optional ECH)   ← your TLS layer
-+--------------------------+
-|  v2ray transport (ws/grpc/ ← your transport layer
-|  httpupgrade/...) OR raw
-+--------------------------+
-|  TCP                       ← your dialer
-+--------------------------+
-```
-
-`ewp.Client.DialConn` accepts a `net.Conn` (the byte stream after TLS
-+ transport) and returns a `net.Conn` whose Read/Write transparently
-encrypt under EWP's per-direction AEAD.
-
-## Minimal client
+## Client Setup
 
 ```go
-import (
-    "context"
-    "crypto/tls"
-    "net"
-
-    "github.com/justinwoo280/sing-ewp"
-)
-
-func dialEWP(ctx context.Context, server, uuid string, dst ewp.Address) (net.Conn, error) {
-    raw, err := (&net.Dialer{}).DialContext(ctx, "tcp", server)
-    if err != nil { return nil, err }
-    tlsConn := tls.Client(raw, &tls.Config{ServerName: "your.server.com"})
-    if err := tlsConn.HandshakeContext(ctx); err != nil {
-        raw.Close()
-        return nil, err
-    }
-    client, err := ewp.NewClient(uuid)
-    if err != nil { tlsConn.Close(); return nil, err }
-    return client.DialConn(ctx, tlsConn, dst)
+credential := ewp.ClientCredential{
+    Principal:  principalID,
+    KAuth:      authKey,
+    Listener:   listenerContext,
+    RouteEpoch: routeEpoch,
 }
-```
-
-## Minimal server
-
-```go
-type myHandler struct { /* your fields */ }
-
-func (h *myHandler) NewConnection(ctx context.Context, conn net.Conn, md ewp.Metadata) error {
-    defer conn.Close()
-    upstream, err := net.Dial("tcp", md.Destination.String())
-    if err != nil { return err }
-    defer upstream.Close()
-    go io.Copy(upstream, conn)
-    _, err = io.Copy(conn, upstream)
+client, err := ewp.NewClientV3(credential, pinnedServerKey, bundleResolver)
+if err != nil {
     return err
 }
-
-func (h *myHandler) NewPacketConnection(ctx context.Context, pc net.PacketConn, md ewp.Metadata) error {
-    /* analogous: dial UDP upstream, shuttle packets */
-    return nil
-}
-
-svc := ewp.NewService(&myHandler{})
-svc.AddUser("11111111-2222-3333-4444-555555555555")
-
-ln, _ := tls.Listen("tcp", ":443", tlsConfig)
-for {
-    conn, err := ln.Accept()
-    if err != nil { return err }
-    go svc.HandleConn(context.Background(), conn)
-}
+conn, err := client.DialConn(ctx, outerConn, ewp.Address{Domain: "example.com", Port: 443})
 ```
 
-## Embedding into sing-box (template)
+`DialConn` does not return until both Finished messages verify. No application
+bytes are sent before that point.
 
-Following the `protocol/vless/` and `transport/v2ray` pattern, an EWP
-adapter sits in `protocol/ewp/{outbound,inbound}.go` and delegates the
-crypto layer to this library.
-
-### `option/ewp.go` (≈30 lines)
+For a carrier that already has message boundaries, pass it directly:
 
 ```go
-package option
-
-type EWPOutboundOptions struct {
-    DialerOptions
-    ServerOptions
-    UUID    string      `json:"uuid"`
-    Network NetworkList `json:"network,omitempty"`
-    OutboundTLSOptionsContainer
-    Multiplex *OutboundMultiplexOptions `json:"multiplex,omitempty"`
-    Transport *V2RayTransportOptions    `json:"transport,omitempty"`
-}
-
-type EWPInboundOptions struct {
-    ListenOptions
-    Users []EWPUser `json:"users,omitempty"`
-    InboundTLSOptionsContainer
-    Multiplex *InboundMultiplexOptions `json:"multiplex,omitempty"`
-    Transport *V2RayTransportOptions   `json:"transport,omitempty"`
-}
-
-type EWPUser struct {
-    Name string `json:"name"`
-    UUID string `json:"uuid"`
-}
+conn, err := client.DialMessageTransport(ctx, messageTransport, destination)
+packetConn, err := client.DialPacketMessageTransport(ctx, messageTransport, destination)
 ```
 
-### `protocol/ewp/outbound.go` (skeleton)
+After a successful handshake the returned adapter owns the message transport.
+On failure, the transport is closed. `LengthFramer` is only needed for a raw
+byte stream; WebSocket, gRPC, and XHTTP adapters must pass each complete EWP
+message unchanged.
+
+If the carrier closes before Finished completes, discard the failed carrier and
+start a fresh complete handshake. The protocol does not transfer handshake
+state between carriers and does not provide a persistence or resume contract.
+
+## Server Setup
 
 ```go
-package ewp
-
-import (
-    "context"
-    "net"
-
-    "github.com/sagernet/sing-box/adapter"
-    "github.com/sagernet/sing-box/adapter/outbound"
-    "github.com/sagernet/sing-box/common/dialer"
-    "github.com/sagernet/sing-box/common/tls"
-    C "github.com/sagernet/sing-box/constant"
-    "github.com/sagernet/sing-box/log"
-    "github.com/sagernet/sing-box/option"
-    "github.com/sagernet/sing-box/transport/v2ray"
-    "github.com/sagernet/sing/common"
-    M "github.com/sagernet/sing/common/metadata"
-    N "github.com/sagernet/sing/common/network"
-
-    sewp "github.com/justinwoo280/sing-ewp"
+service, err := ewp.NewServiceV3(
+    handler,
+    listenerContext,
+    signingIdentity,
+    prekeyProvider,
+    admissionController,
 )
-
-const TypeEWP = "ewp"
-
-func RegisterOutbound(registry *outbound.Registry) {
-    outbound.Register[option.EWPOutboundOptions](registry, TypeEWP, NewOutbound)
+if err != nil {
+    return err
 }
+defer service.Close()
 
-type Outbound struct {
-    outbound.Adapter
-    dialer     N.Dialer
-    serverAddr M.Socksaddr
-    tlsConfig  tls.Config
-    transport  adapter.V2RayClientTransport
-    client     *sewp.Client
-    logger     log.ContextLogger
-}
-
-func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger,
-    tag string, options option.EWPOutboundOptions) (adapter.Outbound, error) {
-
-    d, err := dialer.New(ctx, options.DialerOptions, options.ServerIsDomain())
-    if err != nil { return nil, err }
-
-    o := &Outbound{
-        Adapter:    outbound.NewAdapterWithDialerOptions(TypeEWP, tag, options.Network.Build(), options.DialerOptions),
-        dialer:     d,
-        serverAddr: options.ServerOptions.Build(),
-        logger:     logger,
-    }
-    if options.TLS != nil {
-        o.tlsConfig, err = tls.NewClient(ctx, options.Server, common.PtrValueOrDefault(options.TLS))
-        if err != nil { return nil, err }
-    }
-    if options.Transport != nil {
-        o.transport, err = v2ray.NewClientTransport(ctx, o.dialer, o.serverAddr,
-            common.PtrValueOrDefault(options.Transport), o.tlsConfig)
-        if err != nil { return nil, err }
-    }
-    o.client, err = sewp.NewClient(options.UUID)
-    if err != nil { return nil, err }
-    return o, nil
-}
-
-func (h *Outbound) DialContext(ctx context.Context, network string, dst M.Socksaddr) (net.Conn, error) {
-    raw, err := h.dialUnderlying(ctx)
-    if err != nil { return nil, err }
-    return h.client.DialConn(ctx, raw, socksaddrToEWP(dst))
-}
-
-func (h *Outbound) ListenPacket(ctx context.Context, dst M.Socksaddr) (net.PacketConn, error) {
-    raw, err := h.dialUnderlying(ctx)
-    if err != nil { return nil, err }
-    return h.client.DialPacketConn(ctx, raw, socksaddrToEWP(dst))
-}
-
-func (h *Outbound) dialUnderlying(ctx context.Context) (net.Conn, error) {
-    if h.transport != nil { return h.transport.DialContext(ctx) }
-    raw, err := h.dialer.DialContext(ctx, N.NetworkTCP, h.serverAddr)
-    if err != nil { return nil, err }
-    if h.tlsConfig != nil {
-        return tls.ClientHandshake(ctx, raw, h.tlsConfig)
-    }
-    return raw, nil
-}
-
-func socksaddrToEWP(s M.Socksaddr) sewp.Address {
-    if s.IsFqdn() {
-        return sewp.Address{Domain: s.Fqdn, Port: uint16(s.Port)}
-    }
-    return sewp.Address{Addr: s.AddrPort()}
-}
+return service.HandleConn(ctx, outerConn)
 ```
 
-### `protocol/ewp/inbound.go` (skeleton)
+The handler receives a `net.Conn` or `net.PacketConn` only after client key
+confirmation. Invalid cookies, route tags, admission tags, claims, and
+Finished messages terminate the transport without a semantic alert.
+
+## Required Dependencies
+
+- `PreKeyProvider.ClaimAndBurn` must atomically validate replay state and burn
+  one in-process prekey. Admission leases are acquired separately and released
+  when the current handshake finishes.
+- `AdmissionController` must enforce source, principal, global, and KEM limits;
+  production controllers must also implement `V3AdmissionLeaser`.
+- The outer transport `Close` method must interrupt blocked I/O.
+
+All protocol state is process-local and bounded. `MemoryPreKeyProvider` is
+usable for a single-process deployment when its bundles and principals are
+provisioned by the host. A restart invalidates in-flight handshakes and the
+host must publish fresh one-time prekey material rather than restoring burned
+private keys.
+
+## Address And Records
 
 ```go
-type Inbound struct {
-    inbound.Adapter
-    listener  *listener.Listener
-    tlsConfig tls.ServerConfig
-    transport adapter.V2RayServerTransport
-    service   *sewp.Service
-    router    adapter.ConnectionRouterEx
-    logger    log.ContextLogger
-}
+tcpTarget := ewp.Address{Domain: "example.com", Port: 443}
+udpTarget := ewp.Address{Addr: netip.MustParseAddrPort("8.8.8.8:53")}
 
-// NewConnection on the Service handler dispatches via router:
-type handler struct {
-    router adapter.ConnectionRouterEx
-    logger log.ContextLogger
-}
-
-func (h *handler) NewConnection(ctx context.Context, conn net.Conn, md sewp.Metadata) error {
-    metadata := adapter.InboundContext{
-        Source:      M.SocksaddrFromNet(md.Source),
-        Destination: ewpToSocksaddr(md.Destination),
-    }
-    return h.router.RouteConnectionEx(ctx, conn, metadata, nil)
-}
-
-func (h *handler) NewPacketConnection(ctx context.Context, pc net.PacketConn, md sewp.Metadata) error {
-    metadata := adapter.InboundContext{
-        Source:      M.SocksaddrFromNet(md.Source),
-        Destination: ewpToSocksaddr(md.Destination),
-    }
-    return h.router.RoutePacketConnectionEx(ctx, pc, metadata, nil)
-}
+err := stream.SendTCPData(payload)
+event, err := stream.Recv()
 ```
 
-### Registry hook (`include/registry.go`)
+Use `DialPacketConn` or `DialPacketMessageTransport` for UDP semantics. EWP
+UDP uses the v2.1 UDP-over-TCP model: each sub-session has a random
+`globalID`, `UDP_NEW` carries its default target and optional first datagram,
+`UDP_DATA` can carry a target for one packet, and `UDP_END` closes the
+sub-session. A high-level `net.PacketConn` owns one sub-session; the underlying
+`SecureStream` can carry multiple sub-sessions.
 
-```diff
- import (
-+    "github.com/sagernet/sing-box/protocol/ewp"
- )
+The base transport must preserve message boundaries, ordering, and ownership
+rules, and `Close` must interrupt blocked I/O. Implementing
+`ContextMessageTransport` avoids the fallback goroutine used for legacy
+transports. Implement `MessageTransportInfo` to expose peer addresses to the
+high-level adapters and server handler metadata. Implement the optional
+deadline interfaces when the carrier supports post-handshake deadlines.
 
- func InboundRegistry() *inbound.Registry {
-     ...
-+    ewp.RegisterInbound(registry)
- }
+For a server `CommandUDP` flow, one carrier may create multiple concurrent
+`NewPacketConnection` handler calls. Each handler receives a session-local
+`net.PacketConn`; closing it sends `UDP_END` for that `globalID` without closing
+other sub-sessions. Queue limits are finite and overflow closes the affected
+sub-session.
 
- func OutboundRegistry() *outbound.Registry {
-     ...
-+    ewp.RegisterOutbound(registry)
- }
-```
-
-## Configuration example
-
-```json
-{
-  "outbounds": [{
-    "type": "ewp",
-    "tag": "ewp-out",
-    "server": "your.server.com",
-    "server_port": 443,
-    "uuid": "11111111-2222-3333-4444-555555555555",
-    "tls": {
-      "enabled": true,
-      "server_name": "your.server.com",
-      "ech": {
-        "enabled": true,
-        "config_path": "ech.bin"
-      }
-    },
-    "transport": {
-      "type": "ws",
-      "path": "/ewp"
-    }
-  }]
-}
-```
-
-## Threading and lifecycle
-
-- `*Client` is safe to share across goroutines; each Dial owns its own
-  underlying conn.
-- `*Service` is safe to call `HandleConn` on from many goroutines.
-- The `net.Conn` returned by `Client.DialConn` allows concurrent
-  `Write`, but `Read` MUST come from a single goroutine (this matches
-  the underlying SecureStream contract: the receive AEAD counter would
-  race otherwise).
-- Closing the returned `net.Conn` / `net.PacketConn` is idempotent and
-  safely closes the underlying transport.
-
-## Length framing
-
-EWP v2 is a message-oriented protocol; the on-wire framing of
-individual messages is the responsibility of the transport layer.
-This library provides `LengthFramer`, a 4-byte big-endian length
-prefix wrapper that turns any `net.Conn` into a `MessageTransport`,
-and `Client.DialConn` / `Service.HandleConn` apply it automatically.
-
-If you carry EWP over a transport that already preserves message
-boundaries (WebSocket, gRPC streams, HTTP/3 datagrams), you can
-implement `MessageTransport` directly and use
-`Service.HandleMessageTransport` to skip the redundant length prefix.
-
-## Crypto invariants this library enforces
-
-(See the `README.md` for full spec context.)
-
-- Hybrid X25519 + ML-KEM-768 handshake, per session.
-- Distinct C2S and S2C ChaCha20-Poly1305 keys derived via HKDF-SHA256
-  with 4 separate `info` labels (`EWPv2 c2s key`, `EWPv2 s2c key`,
-  `EWPv2 c2s nonce-prefix`, `EWPv2 s2c nonce-prefix`) — prevents
-  reflection attacks.
-- 64-bit per-direction frame counter wrapped into AEAD nonce —
-  prevents replay and reorder.
-- Outer MAC over ClientHello and ServerHello using the UUID PSK with
-  constant-time comparison — prevents timing oracles on UUID.
-- Ephemeral private keys (`x25519Priv`, `mlkemPriv`) are zeroed and
-  set to `nil` immediately after deriving session keys — bounds the
-  window in which a Heartbleed-style memory disclosure could leak
-  long-term-equivalent secrets.
-
-## Versioning
-
-`v0.x.x` is pre-1.0: the wire format is stable (matches the EWP v2
-spec), but the Go API may evolve in minor revisions as we wire it
-into sing-box and discover unergonomic edges. Pin a tag in `go.mod`
-and read the CHANGELOG before bumping.
+See `EWP_V3_RECORDS.md` for the record layout and `TESTING.md` for verification
+commands.

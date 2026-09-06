@@ -1,240 +1,138 @@
-# `protocol/ewp/v2` — EWP v2 protocol package
+# sing-ewp EWP/v3
 
-> ## ⚠️ Security upgrade — v0.2.0 (EWP/v2.1)
->
-> v0.2.0 closes a 12-finding security audit of the v0.1.x series.
-> Two findings were rated **critical** (S1: offline `ClientHello`
-> decryption when the UUID is leaked; S2: server impersonation by any
-> PSK holder) and require a wire-format break to fix.
->
-> **For new deployments**: use `NewClientV21` / `NewServiceV21` and
-> generate a long-term server static keypair with
-> `GenerateServerStaticKeypair()`. The legacy `NewClient` / `NewService`
-> still build but speak the v0.1.x wire and remain vulnerable to S1+S2.
->
-> **For existing deployments**: see `UPGRADING.md` for a step-by-step
-> migration playbook. v0.2.0 is **not wire-compatible with v0.1.x**;
-> coordinate the upgrade across all peers.
->
-> The complete list of audit findings, their severity, and the
-> regression tests that lock each fix in place is in `CHANGELOG.md`
-> under "v0.2.0 — Security audit response (EWP/v2.1)".
+This branch implements EWP/v3 only. Earlier handshake revisions are not part
+of this package and are not probed or used as fallback.
 
-This package is the **single source of truth** for EWP v2 wire bytes,
-key derivation, framing, and the encrypted bidirectional stream that
-sits on top of an outer transport.
+The v3 handshake provides:
 
-The wire format itself is documented in [`doc/EWP_V2.md`](../../../doc/EWP_V2.md).
-This file is the **API surface contract** for callers in the same
-binary (TUN handler, server dispatcher, transports, ewpmobile).
+- canonical bounded field encoding;
+- signed one-time X25519 plus ML-KEM-768 prekey bundles;
+- stateless retry cookies bound to listener, source, prekey, and transcript;
+- route-tag and admission checks before asymmetric work;
+- atomic replay/prekey claim interfaces;
+- signed ServerHello and bidirectional Finished confirmation;
+- transcript-bound HKDF-SHA-256 traffic keys; and
+- opaque ChaCha20-Poly1305 application records.
 
----
+The normative handshake design is in [`EWP_V3_HANDSHAKE_DESIGN.md`](EWP_V3_HANDSHAKE_DESIGN.md).
+The application record layer is in [`EWP_V3_RECORDS.md`](EWP_V3_RECORDS.md).
+The carrier and UoT boundary is in [`EWP_V3_CARRIER_UOT_DESIGN.md`](EWP_V3_CARRIER_UOT_DESIGN.md).
+The test gates are in [`TESTING.md`](TESTING.md).
 
-## Architectural rules — read these before touching anything
+## Public API
 
-These are not suggestions. Future code that violates them will be
-rejected on review.
+### Client
 
-### Rule 1 — One unified kernel, no client/server split
+```go
+client, err := ewp.NewClientV3(credential, pinnedServerIdentity, prekeyResolver)
+conn, err := client.DialConn(ctx, transportConn, destination)
+packetConn, err := client.DialPacketConn(ctx, transportConn, destination)
 
-There is **one** `protocol/ewp/v2` implementation. Both the client side
-and the server side use the same code path: same handshake helpers,
-same SecureStream, same frame codec, same KDF.
+messageConn, err := client.DialMessageTransport(ctx, messageTransport, destination)
+messagePacketConn, err := client.DialPacketMessageTransport(ctx, messageTransport, destination)
 
-The asymmetry between the two sides exists only at the **direction
-labels** for the keys (`C2SKey` / `S2CKey`) and at the entry point
-(`WriteClientHello` vs `AcceptClientHello`). Everything below is
-shared.
+```
 
-DO NOT:
+`DialMessageTransport` and `DialPacketMessageTransport` are the carrier-neutral
+entry points for WebSocket, gRPC, XHTTP, and other message-oriented transports.
+The returned adapters own the supplied `MessageTransport` after a successful
+handshake. The existing `DialConn` and `DialPacketConn` methods add
+`LengthFramer` for byte-stream carriers.
 
-* fork this package into a `serverv2` / `clientv2` / `mobilev2`.
-* duplicate handshake or frame logic in `internal/server/` or in
-  `tun/` or in any `transport/*` directory.
-* introduce a "client-only optimisation" or "server-only optimisation"
-  that requires divergent code paths.
+`ClientCredential` contains a random `KAuth`, principal identifier, immutable
+listener context, and route epoch. The server identity is an out-of-band
+pinned Ed25519 public key.
 
-If a feature genuinely needs to behave differently on the two sides,
-express that with a parameter or a small role-aware helper inside this
-package, not by forking the package.
+### Server
 
-### Rule 2 — No plaintext fallback, ever
+```go
+service, err := ewp.NewServiceV3(
+    handler,
+    listener,
+    signingIdentity,
+    prekeyProvider,
+    admissionController,
+)
+err = service.HandleConn(ctx, conn)
+```
 
-There is no "direct copy" / "vision" / "skip-AEAD" branch in this
-package. If a future PR adds one, it is wrong. Reject it. The point
-of v2 is that every byte after the handshake is authenticated and
-encrypted.
+Construction requires the handler, immutable listener context, pinned signing
+identity, a prekey provider, and an admission controller. All handshake state,
+replay state, one-time prekey claims, and admission limits are bounded to the
+running process. A carrier or process restart discards in-flight state; the
+client must perform a fresh handshake.
 
-### Rule 3 — Transports must not understand protocol bytes
+The prekey provider's `ClaimAndBurn` operation must atomically validate replay
+state and consume one in-process prekey.
+Production admission controllers must also implement `V3AdmissionLeaser` so
+concurrent processing leases remain bounded.
 
-Transports below this package (WebSocket, gRPC, H3-gRPC-Web, xhttp
-stream-one) must implement only `MessageTransport`:
+### Application Records
+
+The handshake creates `V3SessionKeys`, which initialize the directional stream:
+
+```go
+stream, err := ewp.NewClientSecureStreamV3(transport, keys)
+serverStream, err := ewp.NewServerSecureStreamV3(transport, keys)
+
+err = stream.SendTCPData(payload)
+event, err := stream.Recv()
+```
+
+UDP over TCP keeps the v2.1 sub-session model. One `SecureStream` can carry
+multiple `globalID` values; `UDP_NEW` opens a sub-session with a default target
+and an optional first datagram, `UDP_DATA` may carry a per-packet target, and
+`UDP_END` closes that sub-session. The high-level packet adapter owns one
+`globalID` while the low-level `SecureStream` retains the multiplexing
+primitive. The service-side UDP dispatcher creates one handler and one bounded
+queue per `globalID` while keeping a single receive loop.
+
+## Transport Contract
+
+Transports implement only:
 
 ```go
 type MessageTransport interface {
-    SendMessage(b []byte) error
+    SendMessage([]byte) error
     ReadMessage() ([]byte, error)
     Close() error
 }
 ```
 
-A "message" is one atomic blob delivered as-is. Transports do not look
-at the bytes, do not pad them, do not split them, do not coalesce
-them. All padding / framing / encryption is this package's job.
+Each message is delivered atomically and in order. A carrier must not inspect,
+split, coalesce, or reserialize EWP bytes. `Close` must interrupt blocked reads
+and writes so handshake deadlines are effective. Carriers may additionally
+implement `ContextMessageTransport`, `MessageTransportInfo`, and the optional
+deadline interfaces for cancellation, peer addresses, and post-handshake
+`net.Conn`/`net.PacketConn` deadlines.
 
-### Rule 4 — No version negotiation
+When the outer transport does not expose a `net.Conn`, use
+`HandleMessageTransportWithSource` with a trusted, bounded source token. If
+the carrier implements `MessageTransportInfo`, its `RemoteAddr` is also
+forwarded to handler metadata. The plain `HandleMessageTransport` method
+rejects a nil underlying connection.
 
-There is no v1, no v3, no opt-in, no downgrade. `Magic` is `"EWP2"`,
-hard-coded. A peer that disagrees with these bytes is wrong, not
-"different". Drop the connection.
+For byte-stream transports, `LengthFramer` supplies the message boundary.
 
----
+## Fixed Primitives
 
-## Public API at a glance
-
-### Handshake
-
-```go
-// CLIENT side
-state, err := v2.WriteClientHello(send, uuid, v2.CommandTCP|CommandUDP, addr)
-//   send is the transport's SendMessage. Returns ClientHandshakeState
-//   that holds the ephemeral keys until ServerHello arrives.
-
-result, err := state.ReadServerHello(serverHelloMsg)
-//   result.Keys is the SessionKeys to feed NewClientSecureStream.
-
-// SERVER side
-helloOut, result, err := v2.AcceptClientHello(clientHelloMsg, lookup)
-//   lookup := v2.MakeUUIDLookup([]uuid)
-//   server then SendMessage(helloOut) and uses result.Keys.
-```
-
-### SecureStream
-
-```go
-// One per outer transport connection.
-ss, err := v2.NewClientSecureStream(transport, sessionKeys)
-ss, err := v2.NewServerSecureStream(transport, sessionKeys)
-
-// TCP-style bytes
-err := ss.SendTCPData(payload)
-
-// UDP sub-sessions multiplex inside one SecureStream
-gid := v2.NewGlobalID()
-err := ss.SendUDPNew(gid, target, initialDatagram)
-err := ss.SendUDPData(gid, perFrameTarget, payload)  // perFrameTarget zero == use sub-session default
-err := ss.SendUDPEnd(gid)
-
-// NAT consistency
-err := ss.SendProbeReq(gid)
-err := ss.SendProbeResp(gid, observedAddr)
-
-// Liveness
-err := ss.SendPing(cookie)
-err := ss.SendPong(cookie)
-
-// Cover traffic
-err := ss.SendCoverPad(padBytes)
-
-// Receive (single goroutine; the dispatcher loop)
-ev, err := ss.Recv()
-//   ev.Type, ev.GlobalID, ev.Address, ev.HasAddr, ev.Payload
-
-// Lifecycle
-err := ss.Close()
-b, B, fIn, fOut := ss.Stats()
-```
-
-### Address
-
-```go
-addr := v2.Address{Addr: netip.MustParseAddrPort("8.8.8.8:53")}
-addr := v2.Address{Domain: "example.com", Port: 443}
-
-buf, err := addr.Append(buf)
-addr, n, err := v2.DecodeAddress(buf)
-```
-
-### Frame primitives (you almost never need these directly)
-
-`FrameAEAD`, `EncodeFrame`, `DecodeFrame`, `SuggestPadLen`,
-`NewGlobalID`. SecureStream wraps these. Direct use is reserved for
-tests and the rare protocol diagnostic.
-
----
-
-## Cryptographic primitives — fixed, not configurable
-
-| Purpose | Algorithm |
+| Purpose | Primitive |
 |---|---|
 | AEAD | ChaCha20-Poly1305 |
-| Classical KEM | X25519 |
-| PQ KEM | ML-KEM-768 |
+| Classical component | X25519 |
+| Post-quantum component | ML-KEM-768 |
 | KDF | HKDF-SHA-256 |
-| Outer handshake MAC | HMAC-SHA-256 / 16 |
+| Server signatures | Ed25519 |
 
-These are not negotiated. They are nailed in §1 of the wire spec.
+These primitives and v3 domain labels are not negotiated at runtime.
 
-## Measured performance (AMD EPYC 7543, single core, Go 1.25.5)
+## Verification
 
-| Op | ns/op | throughput | allocs |
-|---|---|---|---|
-| Handshake (client+server) | 605 µs | — | 197 |
-| Handshake client-only | 174 µs | — | 42 |
-| Frame encode 1 KiB | 2.1 µs | 477 MB/s | 4 |
-| Frame encode 16 KiB | 21 µs | 772 MB/s | 4 |
-
-Mobile ARM (extrapolated):
-* Flagship A78 / Apple-M: handshake ~300 µs, 1 KiB frame ~3 µs.
-* Mid-range A55: handshake ~700 µs, 1 KiB frame ~10 µs.
-
-Both are an order of magnitude below TLS 1.3 setup latency itself, so
-the PQ overhead is invisible to users.
-
----
-
-## File layout
-
-```
-address.go      Address codec (IPv4 / IPv6 / domain).
-aead.go         Tiny chacha20poly1305 wrapper to keep imports tidy.
-frame.go        Wire-level frame encode/decode + per-direction AEAD.
-handshake.go    ClientHello / ServerHello + X25519 + ML-KEM-768.
-kdf.go          HKDF-based key & MAC derivation; constants & magic.
-securestream.go High-level Send*/Recv API used by everything else.
-v2_test.go      11 tests covering correctness + replay + tampering +
-                NoPlaintextOnWire.
-bench_test.go   Microbenchmarks (handshake & frame throughput).
+```text
+go test ./...
+go vet ./...
+go test -race -run '^TestV3' -count=1 ./...
+go test -run '^$' -bench '^BenchmarkV3' -benchmem ./...
 ```
 
----
-
-## Concurrency model
-
-* `SecureStream.Send*` methods are safe for concurrent calls. They
-  serialise internally via `writeMu` so the AEAD counter and the wire
-  ordering stay consistent.
-* `SecureStream.Recv` MUST be called from a single goroutine. It
-  advances the receive AEAD counter; concurrent calls would race.
-* `SecureStream.Close` is idempotent and safe from any goroutine.
-* `FrameAEAD` itself is not goroutine-safe. SecureStream is the only
-  entry point that touches it; do not share a `FrameAEAD` across
-  goroutines manually.
-
-## Error contract
-
-Any error returned by `SecureStream.Recv` other than the trivial
-"transport closed cleanly" case (you'll see it as `io.EOF` or
-`io.ErrClosedPipe`) means **the connection is dead**. Do not retry on
-the same SecureStream. Specifically:
-
-* `ErrCounterMismatch` — the peer is replaying or reordering. Tear
-  down.
-* AEAD open failure (wrapped as `ErrAEADOpen` from `frame.go`) — the
-  peer is tampering or has a bug. Tear down.
-* `ErrFrameType` / `ErrFrameTooLarge` / `ErrFrameTooShort` /
-  `ErrMetaTooLarge` / `ErrPadTooLarge` — wire-format violation. Tear
-  down.
-
-These errors deliberately do not carry recovery hints. There is no
-recovery.
+Fuzz targets and the fixed KAT vector policy are documented in `TESTING.md`.
