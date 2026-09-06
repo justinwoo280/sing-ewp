@@ -59,6 +59,13 @@ type SecureStream struct {
 	send    *FrameAEAD
 	recv    *FrameAEAD
 
+	// scheme is the per-connection opening-phase refragmentation plan for
+	// TCP data frames (opening_scheme.go). nil for legacy-record streams
+	// and for streams constructed directly in tests; only the v2.2 opaque
+	// record constructors install one. Consumed positions are send-side
+	// only, guarded by writeMu.
+	scheme *openingScheme
+
 	closeOnce sync.Once
 	closed    atomic.Bool
 
@@ -98,7 +105,7 @@ func newClientSecureStream(tr MessageTransport, keys SessionKeys, version protoc
 	if err != nil {
 		return nil, err
 	}
-	return &SecureStream{tr: tr, version: version, send: send, recv: recv}, nil
+	return &SecureStream{tr: tr, version: version, send: send, recv: recv, scheme: schemeForVersion(version)}, nil
 }
 
 // NewServerSecureStream wraps the post-handshake state on the server
@@ -129,7 +136,17 @@ func newServerSecureStream(tr MessageTransport, keys SessionKeys, version protoc
 	if err != nil {
 		return nil, err
 	}
-	return &SecureStream{tr: tr, version: version, send: send, recv: recv}, nil
+	return &SecureStream{tr: tr, version: version, send: send, recv: recv, scheme: schemeForVersion(version)}, nil
+}
+
+// schemeForVersion installs an opening-phase refragmentation scheme on
+// opaque-record (v2.2/v2.3) streams only. Legacy streams keep their
+// historical padding behaviour.
+func schemeForVersion(version protocolVersion) *openingScheme {
+	if version == protocolVersionV22 {
+		return newOpeningScheme()
+	}
+	return nil
 }
 
 // ----------------------------------------------------------------------
@@ -151,20 +168,23 @@ func (s *SecureStream) sendFrame(t FrameType, meta, payload []byte, padLen int) 
 		return io.ErrClosedPipe
 	}
 	s.writeMu.Lock()
-	wipeRecv := false
-	defer func() {
-		s.writeMu.Unlock()
-		if wipeRecv {
-			s.recvMu.Lock()
-			s.wipeRecvLocked()
-			s.recvMu.Unlock()
-		}
-	}()
+	defer s.writeMu.Unlock()
 	if s.closed.Load() || s.send == nil {
 		return io.ErrClosedPipe
 	}
+	return s.sendFrameLocked(t, meta, payload, padLen, false)
+}
 
-	padLen = s.selectRecordPad(meta, payload, padLen)
+// sendFrameLocked encodes and sends one frame. The caller must hold writeMu
+// and have verified the stream is open. When exactPad is false the pad length
+// is chosen by the bucket policy (selectRecordPad); when true, padLen is used
+// verbatim (opening-phase refragmentation, which computes exact pads itself).
+// On transport-send failure the stream is aborted and both directions wiped,
+// matching the historical sendFrame behaviour.
+func (s *SecureStream) sendFrameLocked(t FrameType, meta, payload []byte, padLen int, exactPad bool) error {
+	if !exactPad {
+		padLen = s.selectRecordPad(meta, payload, padLen)
+	}
 
 	var buf bytes.Buffer
 	buf.Grow(frameHeaderSize + len(meta) + len(payload) + 16 + 2 + padLen)
@@ -175,11 +195,100 @@ func (s *SecureStream) sendFrame(t FrameType, meta, payload []byte, padLen int) 
 	if err := s.tr.SendMessage(wire); err != nil {
 		s.abortTransport()
 		s.wipeSendLocked()
-		wipeRecv = true
+		s.recvMu.Lock()
+		s.wipeRecvLocked()
+		s.recvMu.Unlock()
 		return fmt.Errorf("ewp/v2: transport send: %w", err)
 	}
 	s.bytesOut.Add(uint64(len(wire)))
 	s.frmOut.Add(1)
+	return nil
+}
+
+// sendTCPRefragmented sends payload as a sequence of records whose WIRE sizes
+// exactly match the per-connection opening scheme (see opening_scheme.go):
+// oversized writes are split across scheme-sized records and undersized
+// writes are padded up to the scheme target. This hides the size of the
+// opening application writes (typically an inner handshake) far more strongly
+// than payload-relative bucket padding can, because a large first write no
+// longer maps to a recognisably large frame.
+//
+// "c"-semantics (AnyTLS): refragmentation stops as soon as the application's
+// bytes are on the wire — no padding-only records are invented to complete
+// the scheme. If the payload outlives the scheme, the remainder is sent
+// through the normal steady-state bucket policy.
+//
+// The whole sequence is emitted under a single writeMu hold so concurrent
+// senders (cover frames, ping, another Write) cannot interleave into the
+// middle of the scheme.
+func (s *SecureStream) sendTCPRefragmented(payload []byte) error {
+	if s.closed.Load() {
+		return io.ErrClosedPipe
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.closed.Load() || s.send == nil {
+		return io.ErrClosedPipe
+	}
+
+	p := payload
+	for s.scheme.active() {
+		if len(p) == 0 && !s.scheme.forceCurrent() {
+			break // "c" position: stop as soon as the payload is sent
+		}
+		target, _ := s.scheme.next()
+		if len(p) == 0 {
+			// Forced position with no payload left: complete the opening
+			// silhouette with a pure chaff record at the exact target size,
+			// so frame count does not leak the write size.
+			pad := target - v22RecordOverhead
+			if pad > MaxFramePad {
+				pad = MaxFramePad
+			}
+			if pad < 0 {
+				break
+			}
+			if err := s.sendFrameLocked(FramePaddingOnly, nil, nil, pad, true); err != nil {
+				return err
+			}
+			continue
+		}
+		maxChunk := target - v22RecordOverhead
+		if maxChunk < 1 {
+			maxChunk = 1
+		}
+		chunk := len(p)
+		if chunk > maxChunk {
+			chunk = maxChunk
+		}
+		pad := target - (chunk + v22RecordOverhead)
+		if pad > MaxFramePad {
+			// Payload ran out with the scheme target still far away.
+			// Clamp instead of emitting scheme-completing chaff (this can
+			// only happen on a "c" position, since forced positions are
+			// small enough to be reached with chaff).
+			pad = MaxFramePad
+		}
+		if pad < 0 {
+			pad = 0
+		}
+		if err := s.sendFrameLocked(FrameTCPData, nil, p[:chunk], pad, true); err != nil {
+			return err
+		}
+		p = p[chunk:]
+	}
+	// Scheme exhausted (or never active for this frame): steady-state path,
+	// chunked exactly like the streamConn caller does.
+	for len(p) > 0 {
+		chunk := p
+		if len(chunk) > MaxFrameSize-256 {
+			chunk = chunk[:MaxFrameSize-256]
+		}
+		if err := s.sendFrameLocked(FrameTCPData, nil, chunk, -1, false); err != nil {
+			return err
+		}
+		p = p[len(chunk):]
+	}
 	return nil
 }
 
@@ -248,8 +357,14 @@ func (s *SecureStream) decodeRecord(r io.Reader) (*DecodedFrame, error) {
 	return DecodeFrame(r, s.recv)
 }
 
-// SendTCPData sends a chunk of TCP payload bytes.
+// SendTCPData sends a chunk of TCP payload bytes. On opaque-record
+// (v2.2/v2.3) streams with an active opening scheme, the chunk is
+// refragmented to exact scheme wire sizes; otherwise it is sent as a
+// single bucket-padded frame.
 func (s *SecureStream) SendTCPData(payload []byte) error {
+	if len(payload) > 0 && s.usesV22Records() && s.scheme.active() {
+		return s.sendTCPRefragmented(payload)
+	}
 	return s.sendFrame(FrameTCPData, nil, payload, -1)
 }
 

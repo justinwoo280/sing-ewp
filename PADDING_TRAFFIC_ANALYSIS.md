@@ -78,20 +78,55 @@ Given a wire size, can the attacker tell payload A from payload B?
    never overlap — coarse content-size fingerprinting (small page vs large
    page) is fully possible.
 
+## Update (2026-09-06): opening-phase exact refragmentation
+
+Following the AnyTLS design (scheme-driven stream reshaping), the opening
+phase of v2.2/v2.3 streams now refragments TCP data to **exact scheme wire
+sizes** instead of payload-relative bucket padding (`opening_scheme.go`):
+
+- A fresh scheme is drawn **per connection** from a TLS-1.3-handshake-shaped
+  distribution (400–700, 1200–1500, 2–4×2048–8192, 2×800–1500), so there is
+  no single blacklistable shape and no negotiation is needed (padding is
+  unilateral).
+- Oversized writes are **split** across scheme-sized records; undersized
+  writes are padded up. A large first write no longer maps to a large frame.
+- The first two positions (ClientHello/ServerHello silhouette) are **forced**:
+  if the payload runs out they are completed with FramePaddingOnly chaff, so
+  every connection's opening has identical frame count and near-identical
+  total bytes. Chaff is bounded at ~2.2 KB per connection. Later positions
+  use "c" semantics (stop when the payload does).
+
+### Measured effect (two-point Bayes discrimination, total opening wire bytes)
+
+| First-write pair | Before (bucket only) | After (refragmentation) |
+|------------------|----------------------|--------------------------|
+| 256 B vs 512 B | ~77% | **~50% (pure guessing)** |
+| 1024 B vs 4096 B | 100% | 100% |
+| 2048 B vs 8192 B | 100% | 100% |
+
+Writes inside the forced head (~2.1 KB capacity — the size range of typical
+TLS handshake records) are now **indistinguishable**. Writes beyond it still
+leak total volume (content-size fingerprinting), which remains out of scope
+as documented below. AnyTLS's own forced segment covers only ~1 KB; this
+implementation forces ~2.1 KB.
+
 ## What this policy does and does not protect
 
 **Protects against:**
 - Fine-grained record-size fingerprinting (exact TLS record sizes).
-- Inner-TLS handshake record-sequence fingerprinting (the handshake-phase
-  ladder reshapes the opening frames into a TLS-1.3-like silhouette).
+- Inner-TLS handshake record-sequence fingerprinting: the opening scheme
+  refragments the first records to exact per-connection sizes with a forced
+  two-record head, making writes up to ~2.1 KB indistinguishable in frame
+  count and total bytes.
 - Discrete wire-size histogram spikes (jitter).
 
 **Does NOT protect against:**
-- Coarse content-size fingerprinting across distant size classes (small vs
-  large resource). Closing that needs constant-bit-rate shaping or aggressive
-  cover traffic, at much higher bandwidth cost — out of scope for this
-  design.
-- Timing / inter-arrival analysis (not modelled).
+- Coarse content-size fingerprinting beyond the forced head (writes larger
+  than ~2.1 KB leak frame count / total volume). Closing that needs
+  constant-bit-rate shaping or aggressive cover traffic, at much higher
+  bandwidth cost — out of scope for this design.
+- Timing / inter-arrival analysis (partially addressed by StreamShaper's
+  coalescing and idle cover, not by the padding policy).
 - Total-volume / session-length analysis (padding adds overhead but does not
   equalise session byte counts).
 

@@ -152,9 +152,18 @@ bundle-free.
 
 ## Record layer
 
-Unchanged from v2.2: `frame_v22.go` opaque records, bucketized outer length,
-phase-aware padding. v2.3 session keys share the v2.2 opaque record layer
-(`protocolVersionV22`).
+Wire format unchanged from v2.2: `frame_v22.go` opaque records, bucketized
+outer length, steady-phase padding. v2.3 session keys share the v2.2 opaque
+record layer (`protocolVersionV22`).
+
+The **opening-phase padding** was upgraded to AnyTLS-style exact
+refragmentation (`opening_scheme.go`): the first TCP-data records of every
+stream are shaped to exact per-connection scheme wire sizes (TLS-1.3
+handshake silhouette, freshly drawn per connection), with the first two
+positions forced (completed with FramePaddingOnly chaff when the payload
+runs out) so frame count and total opening bytes are uniform across
+connections up to ~2.1 KB. See PADDING_TRAFFIC_ANALYSIS.md for the measured
+strength.
 
 ## What v2.3 deliberately does NOT do
 

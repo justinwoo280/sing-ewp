@@ -177,14 +177,22 @@ func TestSecureStreamV22_AutoPadsAndRejectsTrailingRecordBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	capture.mu.Lock()
-	if len(capture.msgs) != 1 {
+	// The opening scheme forces the first two records: one data record at
+	// scheme.sizes[0] and one chaff record completing scheme.sizes[1], so
+	// frame count does not leak the write size.
+	if len(capture.msgs) != 2 {
 		capture.mu.Unlock()
-		t.Fatalf("got %d records", len(capture.msgs))
+		t.Fatalf("got %d records, want 2 (data + forced chaff)", len(capture.msgs))
 	}
 	wire := append([]byte(nil), capture.msgs[0]...)
 	capture.mu.Unlock()
-	if len(wire) < handshakeFloorProfile[0] {
-		t.Fatalf("first v2.2 record was not padded to handshake floor: %d", len(wire))
+	// The opening phase is now shaped by the per-connection scheme
+	// (opening_scheme.go): the first record must land exactly on the
+	// scheme's first target wire size — a strictly stronger check than the
+	// old handshake-floor minimum.
+	if len(wire) != stream.scheme.sizes[0] {
+		t.Fatalf("first v2.2 record wire=%d, want exact scheme target %d",
+			len(wire), stream.scheme.sizes[0])
 	}
 	if int(binary.BigEndian.Uint32(wire[:v22OuterLengthSize]))+v22OuterLengthSize != len(wire) {
 		t.Fatal("v2.2 outer length does not cover exactly one ciphertext record")
@@ -308,12 +316,26 @@ func TestSecureStreamV22_RoundTripAndRekey(t *testing.T) {
 	if _, err := NewClientSecureStream(new(noopTransport), keys); !errors.Is(err, ErrProtocolVersion) {
 		t.Fatalf("legacy stream constructor must reject v2.2 keys, got %v", err)
 	}
+	// recvTCP skips cover/chaff frames (FramePaddingOnly) which the opening
+	// scheme emits to complete its forced head; application data is what
+	// this test cares about.
+	recvTCP := func() *Event {
+		for {
+			ev, err := server.Recv()
+			if err != nil {
+				t.Fatalf("recv: %v", err)
+			}
+			if ev.Type == FramePaddingOnly {
+				continue
+			}
+			return ev
+		}
+	}
 	if err := client.SendTCPData([]byte("before-rekey")); err != nil {
 		t.Fatal(err)
 	}
-	ev, err := server.Recv()
-	if err != nil || string(ev.Payload) != "before-rekey" {
-		t.Fatalf("before rekey = %#v, %v", ev, err)
+	if ev := recvTCP(); string(ev.Payload) != "before-rekey" {
+		t.Fatalf("before rekey = %#v", ev)
 	}
 	if err := client.Rekey(); err != nil {
 		t.Fatal(err)
@@ -321,9 +343,8 @@ func TestSecureStreamV22_RoundTripAndRekey(t *testing.T) {
 	if err := client.SendTCPData([]byte("after-rekey")); err != nil {
 		t.Fatal(err)
 	}
-	ev, err = server.Recv()
-	if err != nil || string(ev.Payload) != "after-rekey" {
-		t.Fatalf("after rekey = %#v, %v", ev, err)
+	if ev := recvTCP(); string(ev.Payload) != "after-rekey" {
+		t.Fatalf("after rekey = %#v", ev)
 	}
 }
 
