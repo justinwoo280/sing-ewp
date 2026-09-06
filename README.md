@@ -27,6 +27,10 @@ The v2.2 record format is documented in [`EWP_V22.md`](EWP_V22.md).
 This file is the **API surface contract** for callers in the same
 binary (TUN handler, server dispatcher, transports, ewpmobile).
 
+Source-file ownership (which files are v2.0/2.1/2.2/2.3-specific vs
+shared, and the version-reuse relationships between them) is mapped in
+[`CODE_MAP.md`](CODE_MAP.md).
+
 ## Protocol Layers
 
 `ClientHello` and `ServerHello` in this package mean **EWP protocol messages**.
