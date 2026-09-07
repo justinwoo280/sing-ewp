@@ -159,3 +159,61 @@ func FuzzV23Cookie(f *testing.F) {
 		_ = v23Cookie(key, "srv", source, &ci, snonce, expiresAt, keyID)
 	})
 }
+
+// FuzzV23ClientInitExt fuzzes the v2.3.1 extended ClientInit parser: it must
+// never panic, never read out of bounds, and a successfully parsed extension
+// must round-trip byte-exact.
+func FuzzV23ClientInitExt(f *testing.F) {
+	var init V23ClientInit
+	f.Add(init.marshal())
+	f.Add(marshalV23ClientInitExt(&init, true, nil))
+	f.Add(marshalV23ClientInitExt(&init, true, []byte("ticket-blob")))
+	f.Add([]byte{})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > V23ClientNonceLen+V23RouteTagLen+3+V23TicketMaxLen+64 {
+			t.Skip()
+		}
+		ci, hasCap, ticket, err := parseV23ClientInitExt(data)
+		if err != nil {
+			return
+		}
+		// A successful parse must round-trip byte-exact.
+		if !bytes.Equal(marshalV23ClientInitExt(&ci, hasCap, ticket), data) {
+			t.Fatal("ClientInitExt round trip changed bytes")
+		}
+	})
+}
+
+// FuzzV231TicketOperations throws arbitrary blobs at ticket parsing and
+// verification: no panics, no out-of-bounds, and — the security invariant —
+// a random or tampered blob must NEVER verify successfully.
+func FuzzV231TicketOperations(f *testing.F) {
+	ks, err := newV23TicketKeyStore()
+	if err != nil {
+		f.Fatal(err)
+	}
+	uuid, _ := ParseUUID(v23TestUUID)
+	good, err := ks.mint("srv", uuid, 0, V23TicketLifetimeS)
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(good)
+	f.Add([]byte{})
+	f.Add(bytes.Repeat([]byte{0xff}, V23TicketMaxLen))
+	f.Fuzz(func(t *testing.T, blob []byte) {
+		if len(blob) > V23TicketMaxLen+64 {
+			t.Skip()
+		}
+		// Plaintext parser: must not panic.
+		_, _ = parseV23TicketPlaintext(blob)
+		// Verification: must not panic, and any blob that is not the exact
+		// minted ticket must be rejected (soft-fail, never accepted).
+		pt, err := ks.verify("srv", blob)
+		if err == nil {
+			if !bytes.Equal(blob, good) {
+				t.Fatalf("unminted blob verified (%d bytes)", len(blob))
+			}
+			wipeTicketPlaintext(pt)
+		}
+	})
+}

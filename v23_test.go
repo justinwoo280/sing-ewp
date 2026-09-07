@@ -209,10 +209,14 @@ func TestV23HandshakeReplayRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hrWire, err := server.HandleClientInit(initWire, "test-source")
+	dec, err := server.HandleClientInit(initWire, "test-source")
 	if err != nil {
 		t.Fatalf("HandleClientInit: %v", err)
 	}
+	if dec.Resume != nil || dec.HRWire == nil {
+		t.Fatal("expected standard HelloRetry decision")
+	}
+	hrWire := dec.HRWire
 	chWire, err := state.ReadV23HelloRetry(hrWire, CommandTCP, Address{Domain: "replay.example", Port: 443})
 	if err != nil {
 		t.Fatalf("ReadV23HelloRetry: %v", err)

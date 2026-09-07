@@ -165,6 +165,11 @@ func (c *streamConn) Read(p []byte) (int, error) {
 				continue // empty frame is legal but uninteresting
 			}
 			c.readBuf = ev.Payload
+		case FrameTicket:
+			// v2.3.1 resumption ticket from the server: capture and keep
+			// reading. Never surfaced as application data.
+			c.SecureStream.captureTicket(ev)
+			continue
 		case FramePaddingOnly, FramePing, FramePong:
 			// Cover and keepalive frames have no application payload;
 			// just drop them and read another frame.

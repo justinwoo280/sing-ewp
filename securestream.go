@@ -66,6 +66,12 @@ type SecureStream struct {
 	// only, guarded by writeMu.
 	scheme *openingScheme
 
+	// ticketStore/ticketKey (client side, v2.3.1): when ticketStore is
+	// non-nil, FrameTicket events are captured into it under ticketKey by
+	// the application read loops (streamConn.Read, packetConn.ReadFrom).
+	ticketStore V23TicketStore
+	ticketKey   string
+
 	closeOnce sync.Once
 	closed    atomic.Bool
 
@@ -433,6 +439,30 @@ func (s *SecureStream) SendCoverPad(padLen int) error {
 	return s.sendFrame(FramePaddingOnly, nil, nil, padLen)
 }
 
+// SendTicket emits a v2.3.1 resumption ticket on the data plane. Servers
+// call this right after a successful handshake for clients that set the
+// ClientInit resumption capability flag; the payload is opaque to the
+// record layer.
+func (s *SecureStream) SendTicket(ticket []byte) error {
+	if len(ticket) == 0 || len(ticket) > V23TicketMaxLen {
+		return ErrFrameTooLarge
+	}
+	return s.sendFrame(FrameTicket, nil, ticket, -1)
+}
+
+// captureTicket stores a FrameTicket event's payload into the client-side
+// ticket store, if one is installed. Called from the application read
+// loops; unknown/empty payloads are ignored.
+func (s *SecureStream) captureTicket(ev *Event) {
+	if s.ticketStore == nil || s.ticketKey == "" || ev == nil {
+		return
+	}
+	if ev.Type != FrameTicket || len(ev.Payload) == 0 {
+		return
+	}
+	s.ticketStore.Put(s.ticketKey, ev.Payload)
+}
+
 // ----------------------------------------------------------------------
 // Rekey evolves a fresh per-direction key from the current key plus the
 // running counter. It provides backward secrecy for prior epochs: an attacker
@@ -713,7 +743,7 @@ func (s *SecureStream) Recv() (event *Event, returnErr error) {
 			}
 			copy(ev.GlobalID[:], df.Meta[:8])
 		case FrameTCPData, FramePing, FramePong, FramePaddingOnly,
-			FrameRekeyResp:
+			FrameRekeyResp, FrameTicket:
 			// no meta parsing required
 		default:
 			// FrameType.Valid() in DecodeFrame should already reject this.
@@ -829,6 +859,8 @@ func frameTypeName(t FrameType) string {
 		return "REKEY_RESP"
 	case FramePaddingOnly:
 		return "PADDING_ONLY"
+	case FrameTicket:
+		return "TICKET"
 	default:
 		return fmt.Sprintf("UNKNOWN(0x%02x)", byte(t))
 	}

@@ -52,6 +52,57 @@ func parseV23ClientInit(b []byte) (V23ClientInit, error) {
 	return m, nil
 }
 
+// v23ResumeFlag is the ClientInitExt flags bit advertising v2.3.1
+// resumption support: the client holds (or wishes to receive) a ticket.
+const v23ResumeFlag byte = 0x01
+
+// parseV23ClientInitExt parses the base 32-byte ClientInit and the v2.3.1
+// extended form:
+//
+//	ClientInitExt := ClientNonce(16) ‖ RouteTag(16)
+//	               ‖ flags(1) ‖ ticketLen(2, BE) ‖ ticket
+//
+// hasCap reports whether the resumption capability flag is set; ticket is
+// nil when the client advertised support without holding a ticket
+// (ticketLen=0). The base 32-byte form yields hasCap=false, ticket=nil.
+// Trailing garbage and truncated extensions are rejected.
+func parseV23ClientInitExt(b []byte) (ci V23ClientInit, hasCap bool, ticket []byte, err error) {
+	if len(b) == V23ClientNonceLen+V23RouteTagLen {
+		ci, err = parseV23ClientInit(b)
+		return ci, false, nil, err
+	}
+	const base = V23ClientNonceLen + V23RouteTagLen
+	if len(b) < base+3 {
+		return ci, false, nil, ErrHandshakeShort
+	}
+	copy(ci.ClientNonce[:], b[:V23ClientNonceLen])
+	copy(ci.RouteTag[:], b[V23ClientNonceLen:base])
+	flags := b[base]
+	if flags&v23ResumeFlag == 0 {
+		// An extension that does not advertise the capability is
+		// non-canonical: the base 32-byte form already covers that case.
+		// Rejecting it keeps the encoding unique per meaning.
+		return ci, false, nil, errors.New("ewp/v2.3: ClientInitExt without capability flag")
+	}
+	if flags&^v23ResumeFlag != 0 {
+		return ci, false, nil, errors.New("ewp/v2.3: unknown ClientInitExt flags")
+	}
+	ticketLen := int(binary.BigEndian.Uint16(b[base+1 : base+3]))
+	if ticketLen > V23TicketMaxLen {
+		return ci, false, nil, errors.New("ewp/v2.3: ClientInitExt ticket too large")
+	}
+	if len(b) != base+3+ticketLen {
+		return ci, false, nil, ErrHandshakeShort
+	}
+	if flags&v23ResumeFlag != 0 {
+		hasCap = true
+		if ticketLen > 0 {
+			ticket = append([]byte(nil), b[base+3:]...)
+		}
+	}
+	return ci, hasCap, ticket, nil
+}
+
 // V23HelloRetry is the stateless anti-DoS answer. It also carries the
 // current short-term outer key (signed by the server identity).
 //
@@ -387,7 +438,20 @@ type V23ClientState struct {
 	tServerH  [32]byte
 	clientFin [V23FinishedVrfLen]byte
 	closed    bool
+
+	// v2.3.1 resumption: ticket is the blob presented in ClientInitExt;
+	// resuming marks that the client must emit a resume-mode ClientHello
+	// (or fall back to the standard one on HelloRetry).
+	ticket   []byte
+	resuming bool
 }
+
+// v23HelloRetryWireLen is the fixed wire length of a HelloRetry message.
+// A resumed client distinguishes the server's answer by it: this exact
+// length means the ticket was soft-rejected (HelloRetry), anything else is
+// a ServerHello (resumption accepted).
+const v23HelloRetryWireLen = V23ClientNonceLen + V23ServerNonceLen + 8 +
+	V23CookieLen + V23OuterKeyIDLen + 8 + 8 + X25519PubLen + ed25519.SignatureSize
 
 // WriteV23ClientInit begins a v2.3 handshake: send ClientInit and return the
 // state that consumes HelloRetry.
@@ -420,6 +484,154 @@ func WriteV23ClientInit(
 	}
 	s.tCI = v23Transcript(v23Suite.labelTCI, wire)
 	return s, nil
+}
+
+// WriteV23ClientInitExt begins a v2.3.1-capable handshake. With a non-nil
+// ticket the extended ClientInit is sent and the returned state is marked
+// resuming — the caller must immediately follow with ResumeV23ClientHello
+// (co-flushed, one RTT), then branch on the response length: exactly
+// v23HelloRetryWireLen means soft rejection (feed it to ReadV23HelloRetry and
+// continue the standard flow), anything else is a ServerHello (feed it to
+// ReadV23ServerHello). With ticket nil and capOK true the extension carries
+// an empty ticket: pure capability advertisement on the standard path.
+func WriteV23ClientInitExt(
+	send func([]byte) error,
+	uuid [UUIDLen]byte,
+	serverID string,
+	routeEpoch uint64,
+	serverPub ed25519.PublicKey,
+	ticket []byte,
+	capOK bool,
+) (*V23ClientState, error) {
+	if len(serverID) == 0 || len(serverID) > 255 {
+		return nil, errors.New("ewp/v2.3: invalid server_id")
+	}
+	if len(serverPub) != ed25519.PublicKeySize {
+		return nil, ErrV23Signature
+	}
+	if len(ticket) > V23TicketMaxLen {
+		return nil, errors.New("ewp/v2.3.1: ticket too large")
+	}
+	s := &V23ClientState{
+		uuid:       uuid,
+		serverID:   serverID,
+		routeEpoch: routeEpoch,
+		serverPub:  append(ed25519.PublicKey(nil), serverPub...),
+	}
+	if _, err := io.ReadFull(crand.Reader, s.init.ClientNonce[:]); err != nil {
+		return nil, err
+	}
+	s.init.RouteTag = v23RouteTag(uuid, serverID, routeEpoch)
+
+	var wire []byte
+	if ticket != nil {
+		s.resuming = true
+		s.ticket = append([]byte(nil), ticket...)
+		wire = marshalV23ClientInitExt(&s.init, true, ticket)
+	} else if capOK {
+		wire = marshalV23ClientInitExt(&s.init, true, nil)
+	} else {
+		wire = s.init.marshal()
+	}
+	if err := send(wire); err != nil {
+		return nil, fmt.Errorf("ewp/v2.3: send ClientInit: %w", err)
+	}
+	s.tCI = v23Transcript(v23Suite.labelTCI, wire)
+	return s, nil
+}
+
+func marshalV23ClientInitExt(init *V23ClientInit, capOK bool, ticket []byte) []byte {
+	out := init.marshal()
+	if !capOK && ticket == nil {
+		return out
+	}
+	out = append(out, v23ResumeFlag)
+	var lb [2]byte
+	binary.BigEndian.PutUint16(lb[:], uint16(len(ticket)))
+	out = append(out, lb[:]...)
+	return append(out, ticket...)
+}
+
+// buildV23ClientHelloInner assembles the ClientHello inner plaintext:
+// timestamp ‖ uuid ‖ command ‖ address ‖ padLen ‖ pad. Shared by the
+// standard (HelloRetry) and resumed paths.
+func buildV23ClientHelloInner(s *V23ClientState, cmd Command, addr Address) ([]byte, error) {
+	addrBuf, err := addr.Append(nil)
+	if err != nil {
+		return nil, err
+	}
+	padLen := SuggestPadLen(MinHandshakePad, MaxHandshakePad)
+	inner := make([]byte, 0, 4+UUIDLen+1+len(addrBuf)+2+padLen)
+	var tsBuf [4]byte
+	binary.BigEndian.PutUint32(tsBuf[:], uint32(time.Now().Unix()))
+	inner = append(inner, tsBuf[:]...)
+	inner = append(inner, s.uuid[:]...)
+	inner = append(inner, byte(cmd))
+	inner = append(inner, addrBuf...)
+	var plBuf [2]byte
+	binary.BigEndian.PutUint16(plBuf[:], uint16(padLen))
+	inner = append(inner, plBuf[:]...)
+	pad := make([]byte, padLen)
+	if _, err := io.ReadFull(crand.Reader, pad); err != nil {
+		zero(inner)
+		return nil, err
+	}
+	return append(inner, pad...), nil
+}
+
+// ResumeV23ClientHello builds the resume-mode ClientHello for a state
+// created by WriteV23ClientInitExt with a ticket: v23TicketHash(ticket) in
+// the cookie slot, the outer AEAD keyed by deriveV23ResumeSecrets, and the
+// transcript chained on the ticket blob instead of a HelloRetry. The
+// derived resume server nonce is stored in s.retry so ReadV23ServerHello
+// and session-key derivation work unchanged on either path.
+func (s *V23ClientState) ResumeV23ClientHello(cmd Command, addr Address) (clientHello []byte, err error) {
+	if s == nil || s.closed || !s.resuming || len(s.ticket) == 0 {
+		return nil, ErrV23State
+	}
+	curve := ecdh.X25519()
+	if s.x25519Priv, err = curve.GenerateKey(crand.Reader); err != nil {
+		return nil, err
+	}
+	if s.mlkemPriv, err = mlkem.GenerateKey768(); err != nil {
+		return nil, err
+	}
+
+	s.tHR = v23Transcript(v23Suite.labelTHR, s.tCI[:], s.ticket)
+
+	outerKey, serverNonce, err := deriveV23ResumeSecrets(s.uuid, s.ticket, s.init.ClientNonce)
+	if err != nil {
+		return nil, err
+	}
+	s.retry.ServerNonce = serverNonce
+
+	inner, err := buildV23ClientHelloInner(s, cmd, addr)
+	if err != nil {
+		zero(outerKey[:])
+		return nil, err
+	}
+	aead, err := newHandshakeAEAD(outerKey)
+	zero(outerKey[:])
+	if err != nil {
+		zero(inner)
+		return nil, err
+	}
+	var aeadNonce [AEADNonceLen]byte
+	copy(aeadNonce[:], s.init.ClientNonce[:AEADNonceLen])
+	ct := aead.Seal(nil, aeadNonce[:], inner, s.tHR[:])
+	zero(inner)
+
+	var xPub [X25519PubLen]byte
+	copy(xPub[:], s.x25519Priv.PublicKey().Bytes())
+	pqPub := s.mlkemPriv.EncapsulationKey().Bytes()
+	th := v23TicketHash(s.ticket)
+	out := make([]byte, 0, 32+X25519PubLen+MLKEM768PubLen+len(ct))
+	out = append(out, th[:]...)
+	out = append(out, xPub[:]...)
+	out = append(out, pqPub...)
+	out = append(out, ct...)
+	s.tCH = v23Transcript(v23Suite.labelTCH, s.tHR[:], out)
+	return out, nil
 }
 
 // ReadV23HelloRetry verifies the cookie freshness and outer-key signature and
@@ -478,26 +690,10 @@ func (s *V23ClientState) ReadV23HelloRetry(msg []byte, cmd Command, addr Address
 	zero(outerKeyBytes)
 
 	// Inner plaintext: timestamp || uuid || command || address || pad.
-	addrBuf, err := addr.Append(nil)
+	inner, err := buildV23ClientHelloInner(s, cmd, addr)
 	if err != nil {
 		return nil, err
 	}
-	padLen := SuggestPadLen(MinHandshakePad, MaxHandshakePad)
-	inner := make([]byte, 0, 4+UUIDLen+1+len(addrBuf)+2+padLen)
-	var tsBuf [4]byte
-	binary.BigEndian.PutUint32(tsBuf[:], uint32(time.Now().Unix()))
-	inner = append(inner, tsBuf[:]...)
-	inner = append(inner, s.uuid[:]...)
-	inner = append(inner, byte(cmd))
-	inner = append(inner, addrBuf...)
-	var plBuf [2]byte
-	binary.BigEndian.PutUint16(plBuf[:], uint16(padLen))
-	inner = append(inner, plBuf[:]...)
-	pad := make([]byte, padLen)
-	if _, err := io.ReadFull(crand.Reader, pad); err != nil {
-		return nil, err
-	}
-	inner = append(inner, pad...)
 
 	aead, err := newHandshakeAEAD(outerKey)
 	zero(outerKey[:])
@@ -549,12 +745,13 @@ type V23ServerHelloResult struct {
 }
 
 type v23Server struct {
-	cfg       *V23ServerConfig
-	keys      *v23OuterKeyStore
-	routes    map[[V23RouteTagLen]byte][UUIDLen]byte
-	admission *v23Admission
-	replay    *ReplayCache
-	now       func() time.Time
+	cfg        *V23ServerConfig
+	keys       *v23OuterKeyStore
+	ticketKeys *v23TicketKeyStore
+	routes     map[[V23RouteTagLen]byte][UUIDLen]byte
+	admission  *v23Admission
+	replay     *ReplayCache
+	now        func() time.Time
 }
 
 func newV23Server(cfg *V23ServerConfig) (*v23Server, error) {
@@ -565,13 +762,18 @@ func newV23Server(cfg *V23ServerConfig) (*v23Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	ticketKeys, err := newV23TicketKeyStore()
+	if err != nil {
+		return nil, err
+	}
 	s := &v23Server{
-		cfg:       cfg,
-		keys:      keys,
-		routes:    make(map[[V23RouteTagLen]byte][UUIDLen]byte, len(cfg.UUIDs)),
-		admission: newV23Admission(0, 0, 0, 0),
-		replay:    NewReplayCache(ReplayWindow),
-		now:       time.Now,
+		cfg:        cfg,
+		keys:       keys,
+		ticketKeys: ticketKeys,
+		routes:     make(map[[V23RouteTagLen]byte][UUIDLen]byte, len(cfg.UUIDs)),
+		admission:  newV23Admission(0, 0, 0, 0),
+		replay:     NewReplayCache(ReplayWindow),
+		now:        time.Now,
 	}
 	for _, u := range cfg.UUIDs {
 		s.routes[v23RouteTag(u, cfg.ServerID, cfg.RouteEpoch)] = u
@@ -579,15 +781,56 @@ func newV23Server(cfg *V23ServerConfig) (*v23Server, error) {
 	return s, nil
 }
 
-// HandleClientInit answers a ClientInit with a stateless HelloRetry. No
-// asymmetric work is performed here.
-func (s *v23Server) HandleClientInit(msg []byte, source string) ([]byte, error) {
-	ci, err := parseV23ClientInit(msg)
+// v23ResumeContext carries a verified resumption ticket from HandleClientInit
+// to the resumed ClientHello path. Non-nil means HelloRetry is skipped
+// entirely.
+type v23ResumeContext struct {
+	uuid   [UUIDLen]byte
+	ticket []byte // exact blob from ClientInitExt, feeds the transcript
+}
+
+// v23InitDecision is HandleClientInit's routing of one ClientInit(Ext).
+type v23InitDecision struct {
+	// HRWire non-nil: normal path — send it, expect a standard ClientHello.
+	HRWire []byte
+	// Resume non-nil: resumption accepted — expect a resume-mode
+	// ClientHello (HandleClientHelloResumed); no HelloRetry is sent.
+	Resume *v23ResumeContext
+	// HasCap: client advertised the resumption capability flag; after a
+	// successful handshake the server mints a fresh ticket.
+	HasCap bool
+	// HadTicket: the client presented a ticket (whether or not it
+	// verified). When the resumption was soft-rejected (Resume nil), the
+	// client has already flushed a resume-mode ClientHello that must be
+	// read and discarded before HRWire is sent, so its fallback standard
+	// ClientHello arrives on a clean channel.
+	HadTicket bool
+}
+
+// HandleClientInit answers a ClientInit with a stateless HelloRetry — or,
+// when the client presents a valid resumption ticket (v2.3.1), accepts the
+// resumption and skips HelloRetry entirely. An invalid/expired ticket is a
+// soft rejection yielding the normal HelloRetry path, never an error (R2).
+// No asymmetric work is performed here.
+func (s *v23Server) HandleClientInit(msg []byte, source string) (*v23InitDecision, error) {
+	ci, hasCap, ticket, err := parseV23ClientInitExt(msg)
 	if err != nil {
 		return nil, err
 	}
-	if _, ok := s.routes[ci.RouteTag]; !ok {
+	uuid, ok := s.routes[ci.RouteTag]
+	if !ok {
 		return nil, ErrV23Route
+	}
+	if ticket != nil {
+		if pt, verr := s.ticketKeys.verify(s.cfg.ServerID, ticket); verr == nil && pt.uuid == uuid && pt.routeEpoch == s.cfg.RouteEpoch {
+			wipeTicketPlaintext(pt)
+			return &v23InitDecision{
+				Resume:    &v23ResumeContext{uuid: uuid, ticket: ticket},
+				HasCap:    hasCap,
+				HadTicket: true,
+			}, nil
+		}
+		// Soft rejection: fall through to the normal HelloRetry path (R2).
 	}
 	key, err := s.keys.currentKey()
 	if err != nil {
@@ -605,7 +848,7 @@ func (s *v23Server) HandleClientInit(msg []byte, source string) ([]byte, error) 
 	copy(hr.OuterX25519[:], key.pub[:])
 	hr.Cookie = v23Cookie(s.cfg.CookieKey, s.cfg.ServerID, source, &ci, hr.ServerNonce, hr.ExpiresAt, hr.OuterKeyID)
 	hr.Signature = s.keys.signKey(key)
-	return hr.marshal(), nil
+	return &v23InitDecision{HRWire: hr.marshal(), HasCap: hasCap, HadTicket: ticket != nil}, nil
 }
 
 // HandleClientHello verifies cookie + route + admission, then performs the
@@ -617,7 +860,7 @@ func (s *v23Server) HandleClientHello(ctx interface{ Done() <-chan struct{} }, i
 	}
 	defer release()
 
-	ci, err := parseV23ClientInit(initWire)
+	ci, _, _, err := parseV23ClientInitExt(initWire)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -673,10 +916,7 @@ func (s *v23Server) HandleClientHello(ctx interface{ Done() <-chan struct{} }, i
 		return nil, nil, ErrV23Cookie
 	}
 	var cliEphPub [X25519PubLen]byte
-	copy(cliEphPub[:], chWire[off:]); off += X25519PubLen
-	var pqPub [MLKEM768PubLen]byte
-	copy(pqPub[:], chWire[off:]); off += MLKEM768PubLen
-	ct := chWire[off:]
+	copy(cliEphPub[:], chWire[off:])
 
 	curve := ecdh.X25519()
 	cliEph, err := curve.NewPublicKey(cliEphPub[:])
@@ -700,6 +940,88 @@ func (s *v23Server) HandleClientHello(ctx interface{ Done() <-chan struct{} }, i
 	var outerKey [AEADKeyLen]byte
 	copy(outerKey[:], outerKeyBytes)
 	zero(outerKeyBytes)
+
+	return s.finishClientHello(ctx, ci, chWire, hr.Cookie[:], tHR, hr.ServerNonce, uuid, outerKey)
+}
+
+// HandleClientHelloResumed completes a v2.3.1 resumed handshake: the ticket
+// verified in HandleClientInit replaces the cookie (DoS gate) and the outer
+// key store, so no HelloRetry round-trip was needed. Everything after the
+// outer AEAD open is byte-identical to the standard path: fresh hybrid key
+// exchange, transcript binding, Finished MACs, session-key derivation (R1).
+//
+// The resume-mode ClientHello carries v23TicketHash(ticket) in the cookie
+// slot; it is checked in constant time so a ticket swap between ClientInit
+// and ClientHello fails.
+func (s *v23Server) HandleClientHelloResumed(ctx interface{ Done() <-chan struct{} }, resume *v23ResumeContext, initWire, chWire []byte, source string) (serverHello []byte, res *V23ServerHelloResult, err error) {
+	if resume == nil {
+		return nil, nil, ErrV23State
+	}
+	release, err := s.admission.acquire(source)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer release()
+
+	ci, _, _, err := parseV23ClientInitExt(initWire)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Same cross-handshake replay rejection as the standard path: every
+	// resumption uses a fresh ClientNonce, so legitimate reconnects are never
+	// false-positive while a replayed transcript is rejected outright.
+	var nonce [HandshakeNonce]byte
+	copy(nonce[:], ci.ClientNonce[:HandshakeNonce])
+	if s.replay != nil && !s.replay.MarkSeenOrReject(resume.uuid, nonce) {
+		return nil, nil, ErrReplay
+	}
+
+	outerKey, serverNonce, err := deriveV23ResumeSecrets(resume.uuid, resume.ticket, ci.ClientNonce)
+	if err != nil {
+		return nil, nil, err
+	}
+	ticketHash := v23TicketHash(resume.ticket)
+	tCI := v23Transcript(v23Suite.labelTCI, initWire)
+	tHR := v23Transcript(v23Suite.labelTHR, tCI[:], resume.ticket)
+
+	return s.finishClientHello(ctx, ci, chWire, ticketHash[:], tHR, serverNonce, resume.uuid, outerKey)
+}
+
+// finishClientHello is the shared tail of the standard and resumed
+// ClientHello paths: KEM admission, cookie-slot check, outer-AEAD open,
+// inner plaintext validation, timestamp window, hybrid key exchange,
+// ServerHello construction and Finished-key derivation. cookieEcho is the
+// expected value of the wire's cookie slot (hr.Cookie normally, ticket hash
+// on resumption); serverNonce feeds status encryption and session keys.
+// outerKey is wiped inside before return.
+func (s *v23Server) finishClientHello(ctx interface{ Done() <-chan struct{} }, ci V23ClientInit, chWire, cookieEcho []byte, tHR [32]byte, serverNonce [V23ServerNonceLen]byte, uuid [UUIDLen]byte, outerKey [AEADKeyLen]byte) (serverHello []byte, res *V23ServerHelloResult, err error) {
+	kemRelease, err := s.admission.acquireKEM(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer kemRelease()
+
+	if len(chWire) < V23CookieLen+X25519PubLen+MLKEM768PubLen+chacha20poly1305Overhead {
+		return nil, nil, ErrHandshakeShort
+	}
+	off := 0
+	if subtle.ConstantTimeCompare(chWire[off:off+V23CookieLen], cookieEcho) != 1 {
+		return nil, nil, ErrV23Cookie
+	}
+	off += V23CookieLen
+	var cliEphPub [X25519PubLen]byte
+	copy(cliEphPub[:], chWire[off:]); off += X25519PubLen
+	var pqPub [MLKEM768PubLen]byte
+	copy(pqPub[:], chWire[off:]); off += MLKEM768PubLen
+	ct := chWire[off:]
+
+	curve := ecdh.X25519()
+	cliEph, err := curve.NewPublicKey(cliEphPub[:])
+	if err != nil {
+		return nil, nil, ErrStaticPub
+	}
+
 	aead, err := newHandshakeAEAD(outerKey)
 	zero(outerKey[:])
 	if err != nil {
@@ -784,7 +1106,8 @@ func (s *v23Server) HandleClientHello(ctx interface{ Done() <-chan struct{} }, i
 	if err != nil {
 		return nil, nil, err
 	}
-	helloKeyBytes, err := v23HKDF(psk[:], v23Suite.labelHelloKey, tSH[:], AEADKeyLen)
+	helloPSK := uuidPSK(uuid)
+	helloKeyBytes, err := v23HKDF(helloPSK[:], v23Suite.labelHelloKey, tSH[:], AEADKeyLen)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -797,7 +1120,7 @@ func (s *v23Server) HandleClientHello(ctx interface{ Done() <-chan struct{} }, i
 		return nil, nil, err
 	}
 	var shNonce [AEADNonceLen]byte
-	copy(shNonce[:], hr.ServerNonce[:AEADNonceLen])
+	copy(shNonce[:], serverNonce[:AEADNonceLen])
 	statusCt := helloAEAD.Seal(nil, shNonce[:], []byte{0x00}, tSH[:])
 
 	shWire := append(shBody, statusCt...)
@@ -814,7 +1137,7 @@ func (s *v23Server) HandleClientHello(ctx interface{ Done() <-chan struct{} }, i
 	if err != nil {
 		return nil, nil, err
 	}
-	keys := deriveV23SessionKeys(trafficPRK, classicalArr, ci.ClientNonce, hr.ServerNonce, tSH)
+	keys := deriveV23SessionKeys(trafficPRK, classicalArr, ci.ClientNonce, serverNonce, tSH)
 
 	return shWire, &V23ServerHelloResult{
 		Keys:        keys,

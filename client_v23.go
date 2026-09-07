@@ -20,6 +20,12 @@ type ClientV23 struct {
 	serverID   string
 	routeEpoch uint64
 	serverPub  ed25519.PublicKey
+
+	// ticketStore, when non-nil (see SetTicketStore), enables v2.3.1
+	// resumption: the client advertises the capability, caches every
+	// ticket the server pushes, and attempts a 1-RTT resume on the next
+	// connection to the same server.
+	ticketStore V23TicketStore
 }
 
 // NewClientV23 builds a v2.3 client.
@@ -56,7 +62,11 @@ func (c *ClientV23) UUID() [UUIDLen]byte { return c.uuid }
 // TCP stream. The returned conn owns the transport.
 func (c *ClientV23) DialConn(ctx context.Context, conn net.Conn, dst Address) (net.Conn, error) {
 	tr := NewLengthFramer(conn)
-	stream, err := c.handshake(ctx, tr, CommandTCP, dst)
+	remoteAddr := ""
+	if conn.RemoteAddr() != nil {
+		remoteAddr = conn.RemoteAddr().String()
+	}
+	stream, err := c.handshake(ctx, tr, CommandTCP, dst, remoteAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -69,49 +79,103 @@ func (c *ClientV23) DialConn(ctx context.Context, conn net.Conn, dst Address) (n
 // UDP-over-TCP packet conn.
 func (c *ClientV23) DialPacketConn(ctx context.Context, conn net.Conn, dst Address) (net.PacketConn, error) {
 	tr := NewLengthFramer(conn)
-	stream, err := c.handshake(ctx, tr, CommandUDP, dst)
+	remoteAddr := ""
+	if conn.RemoteAddr() != nil {
+		remoteAddr = conn.RemoteAddr().String()
+	}
+	stream, err := c.handshake(ctx, tr, CommandUDP, dst, remoteAddr)
 	if err != nil {
 		return nil, err
 	}
 	return newClientPacketConn(stream, conn, dst), nil
 }
 
-func (c *ClientV23) handshake(ctx context.Context, tr MessageTransport, cmd Command, dst Address) (*SecureStream, error) {
+func (c *ClientV23) handshake(ctx context.Context, tr MessageTransport, cmd Command, dst Address, remoteAddr string) (*SecureStream, error) {
 	hctx, finish := beginHandshake(ctx, tr)
 	defer finish()
 
-	state, err := WriteV23ClientInit(func(msg []byte) error {
-		return sendMessageContext(hctx, tr, msg)
-	}, c.uuid, c.serverID, c.routeEpoch, c.serverPub)
+	send := func(msg []byte) error { return sendMessageContext(hctx, tr, msg) }
+
+	var ticket []byte
+	serverKey := ""
+	if c.ticketStore != nil {
+		serverKey = c.v23TicketServerKey(remoteAddr)
+		ticket, _ = c.ticketStore.Get(serverKey)
+	}
+
+	state, err := WriteV23ClientInitExt(send, c.uuid, c.serverID, c.routeEpoch, c.serverPub,
+		ticket, c.ticketStore != nil)
 	if err != nil {
 		_ = tr.Close()
 		return nil, fmt.Errorf("ewp/v2.3: send ClientInit: %w", err)
 	}
-	hrWire, err := readMessageContext(hctx, tr)
-	if err != nil {
-		_ = tr.Close()
-		return nil, fmt.Errorf("ewp/v2.3: read HelloRetry: %w", err)
-	}
-	chWire, err := state.ReadV23HelloRetry(hrWire, cmd, dst)
-	if err != nil {
-		_ = tr.Close()
-		return nil, fmt.Errorf("ewp/v2.3: build ClientHello: %w", err)
-	}
-	if err := sendMessageContext(hctx, tr, chWire); err != nil {
-		_ = tr.Close()
-		return nil, fmt.Errorf("ewp/v2.3: send ClientHello: %w", err)
-	}
-	shWire, err := readMessageContext(hctx, tr)
-	if err != nil {
-		_ = tr.Close()
-		return nil, fmt.Errorf("ewp/v2.3: read ServerHello: %w", err)
+
+	var shWire []byte
+	if state.resuming {
+		// 1-RTT attempt: co-flush the resume-mode ClientHello with the
+		// ClientInit, then branch on the answer's shape.
+		chWire, err := state.ResumeV23ClientHello(cmd, dst)
+		if err != nil {
+			_ = tr.Close()
+			return nil, fmt.Errorf("ewp/v2.3: build resumed ClientHello: %w", err)
+		}
+		if err := send(chWire); err != nil {
+			_ = tr.Close()
+			return nil, fmt.Errorf("ewp/v2.3: send resumed ClientHello: %w", err)
+		}
+		shWire, err = readMessageContext(hctx, tr)
+		if err != nil {
+			_ = tr.Close()
+			return nil, fmt.Errorf("ewp/v2.3: read ServerHello: %w", err)
+		}
+		if len(shWire) == v23HelloRetryWireLen {
+			// Soft rejection (expired/rotated/unknown ticket): fall back
+			// to the standard flow with this HelloRetry. The server has
+			// already discarded our resume-mode ClientHello.
+			c.ticketStore.Delete(serverKey)
+			state.resuming = false
+			chWire, err := state.ReadV23HelloRetry(shWire, cmd, dst)
+			if err != nil {
+				_ = tr.Close()
+				return nil, fmt.Errorf("ewp/v2.3: build ClientHello: %w", err)
+			}
+			if err := send(chWire); err != nil {
+				_ = tr.Close()
+				return nil, fmt.Errorf("ewp/v2.3: send ClientHello: %w", err)
+			}
+			shWire, err = readMessageContext(hctx, tr)
+			if err != nil {
+				_ = tr.Close()
+				return nil, fmt.Errorf("ewp/v2.3: read ServerHello: %w", err)
+			}
+		}
+	} else {
+		hrWire, err := readMessageContext(hctx, tr)
+		if err != nil {
+			_ = tr.Close()
+			return nil, fmt.Errorf("ewp/v2.3: read HelloRetry: %w", err)
+		}
+		chWire, err := state.ReadV23HelloRetry(hrWire, cmd, dst)
+		if err != nil {
+			_ = tr.Close()
+			return nil, fmt.Errorf("ewp/v2.3: build ClientHello: %w", err)
+		}
+		if err := send(chWire); err != nil {
+			_ = tr.Close()
+			return nil, fmt.Errorf("ewp/v2.3: send ClientHello: %w", err)
+		}
+		shWire, err = readMessageContext(hctx, tr)
+		if err != nil {
+			_ = tr.Close()
+			return nil, fmt.Errorf("ewp/v2.3: read ServerHello: %w", err)
+		}
 	}
 	cfWire, res, err := state.ReadV23ServerHello(shWire)
 	if err != nil {
 		_ = tr.Close()
 		return nil, fmt.Errorf("ewp/v2.3: process ServerHello: %w", err)
 	}
-	if err := sendMessageContext(hctx, tr, cfWire); err != nil {
+	if err := send(cfWire); err != nil {
 		_ = tr.Close()
 		return nil, fmt.Errorf("ewp/v2.3: send ClientFinished: %w", err)
 	}
@@ -130,6 +194,8 @@ func (c *ClientV23) handshake(ctx context.Context, tr MessageTransport, cmd Comm
 		_ = tr.Close()
 		return nil, fmt.Errorf("ewp/v2.3: build SecureStream: %w", err)
 	}
+	stream.ticketStore = c.ticketStore
+	stream.ticketKey = serverKey
 	return stream, nil
 }
 
@@ -262,24 +328,52 @@ func (s *ServiceV23) handleTransport(ctx context.Context, tr MessageTransport, u
 		_ = tr.Close()
 		return fmt.Errorf("ewp/v2.3: read ClientInit: %w", err)
 	}
-	hrWire, err := server.HandleClientInit(initWire, source)
+	dec, err := server.HandleClientInit(initWire, source)
 	if err != nil {
 		_ = tr.Close()
 		return fmt.Errorf("ewp/v2.3: answer ClientInit: %w", err)
 	}
-	if err := sendMessageContext(hctx, tr, hrWire); err != nil {
-		_ = tr.Close()
-		return fmt.Errorf("ewp/v2.3: send HelloRetry: %w", err)
-	}
-	chWire, err := readMessageContext(hctx, tr)
-	if err != nil {
-		_ = tr.Close()
-		return fmt.Errorf("ewp/v2.3: read ClientHello: %w", err)
-	}
-	shWire, res, err := server.HandleClientHello(hctx, initWire, hrWire, chWire, source)
-	if err != nil {
-		_ = tr.Close()
-		return fmt.Errorf("ewp/v2.3: accept ClientHello: %w", err)
+	var shWire []byte
+	var res *V23ServerHelloResult
+	if dec.Resume != nil {
+		// v2.3.1 resumption accepted: no HelloRetry. The client's
+		// resume-mode ClientHello was flushed together with ClientInit and
+		// is already waiting to be read.
+		chWire, err := readMessageContext(hctx, tr)
+		if err != nil {
+			_ = tr.Close()
+			return fmt.Errorf("ewp/v2.3: read resumed ClientHello: %w", err)
+		}
+		shWire, res, err = server.HandleClientHelloResumed(hctx, dec.Resume, initWire, chWire, source)
+		if err != nil {
+			_ = tr.Close()
+			return fmt.Errorf("ewp/v2.3: accept resumed ClientHello: %w", err)
+		}
+	} else {
+		if dec.HadTicket {
+			// The ticket was soft-rejected but the client already flushed
+			// a resume-mode ClientHello behind its ClientInit (v2.3.1
+			// clients always co-send them). Read and discard it so the
+			// fallback standard ClientHello arrives on a clean channel.
+			if _, err := readMessageContext(hctx, tr); err != nil {
+				_ = tr.Close()
+				return fmt.Errorf("ewp/v2.3: discard resume-mode ClientHello: %w", err)
+			}
+		}
+		if err := sendMessageContext(hctx, tr, dec.HRWire); err != nil {
+			_ = tr.Close()
+			return fmt.Errorf("ewp/v2.3: send HelloRetry: %w", err)
+		}
+		chWire, err := readMessageContext(hctx, tr)
+		if err != nil {
+			_ = tr.Close()
+			return fmt.Errorf("ewp/v2.3: read ClientHello: %w", err)
+		}
+		shWire, res, err = server.HandleClientHello(hctx, initWire, dec.HRWire, chWire, source)
+		if err != nil {
+			_ = tr.Close()
+			return fmt.Errorf("ewp/v2.3: accept ClientHello: %w", err)
+		}
 	}
 	if err := sendMessageContext(hctx, tr, shWire); err != nil {
 		_ = tr.Close()
@@ -304,6 +398,19 @@ func (s *ServiceV23) handleTransport(ctx context.Context, tr MessageTransport, u
 	if err != nil {
 		_ = tr.Close()
 		return fmt.Errorf("ewp/v2.3: build server SecureStream: %w", err)
+	}
+
+	// v2.3.1: mint a fresh resumption ticket for capable clients and push
+	// it as the first data-plane frame, before the handler can interleave
+	// writes. Minted on every successful handshake (full or resumed) so the
+	// client always holds the latest ticket.
+	if dec.HasCap {
+		if ticket, terr := server.ticketKeys.mint(s.cfg.ServerID, res.uuid, s.cfg.RouteEpoch, V23TicketLifetimeS); terr == nil {
+			if serr := stream.SendTicket(ticket); serr != nil {
+				_ = stream.Close()
+				return fmt.Errorf("ewp/v2.3: send resumption ticket: %w", serr)
+			}
+		}
 	}
 
 	finish()

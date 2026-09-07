@@ -155,6 +155,11 @@ func (p *packetConn) ReadFrom(b []byte) (int, net.Addr, error) {
 		case FramePing, FramePong, FramePaddingOnly,
 			FrameUDPProbeReq, FrameUDPProbeResp:
 			continue
+		case FrameTicket:
+			// v2.3.1 resumption ticket from the server: capture and keep
+			// reading.
+			p.stream.captureTicket(ev)
+			continue
 		default:
 			err := fmt.Errorf("ewp: unexpected frame type %d on packet conn", ev.Type)
 			_ = p.stream.Close()

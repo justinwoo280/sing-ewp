@@ -26,6 +26,11 @@ const (
 	FrameRekeyReq     FrameType = 0x12
 	FrameRekeyResp    FrameType = 0x13
 	FramePaddingOnly  FrameType = 0x20
+	// FrameTicket carries a v2.3.1 resumption ticket from the server, early
+	// on the data plane, to clients that set the ClientInit resumption
+	// capability flag. v2.3.0 clients never receive it (they never set the
+	// flag), so it adds no compatibility surface.
+	FrameTicket       FrameType = 0x21
 )
 
 func (t FrameType) Valid() bool {
@@ -34,7 +39,7 @@ func (t FrameType) Valid() bool {
 		FrameUDPProbeReq, FrameUDPProbeResp,
 		FramePing, FramePong,
 		FrameRekeyReq, FrameRekeyResp,
-		FramePaddingOnly:
+		FramePaddingOnly, FrameTicket:
 		return true
 	}
 	return false
